@@ -67,10 +67,11 @@ class SLAMConfig:
     conf_min_abs: float = 0.0
 
     # Keyframe selection
-    keyframe_method: str = "lk"           # "lk" or "waft"
+    keyframe_method: str = "waft"         # "waft" (default) or "lk"
     waft_ckpt_path: Optional[str] = None  # required when keyframe_method="waft"
     min_disparity: float = 50.0
     use_keyframe_selection: bool = True
+    shadow_keyframe_method: Optional[str] = "lk"  # run this backend alongside primary for comparison (None = off)
     kf_debug_dir: Optional[str] = None    # save flow visualizations when set
 
     # Loop closure
@@ -85,7 +86,7 @@ class SLAMConfig:
 
     # Visualization
     vis_voxel_size: Optional[float] = None
-    viewer_port: int = 8080
+    viewer_port: int = 0
     viewer_max_points: Optional[int] = 10000  # 0 or None = no downsampling
 
     # Debug
@@ -103,6 +104,15 @@ class SLAMConfig:
 
     # Source config file path (for backup into run directory)
     config_yaml_path: Optional[str] = None
+
+    def __post_init__(self):
+        needs_waft = (self.keyframe_method == "waft" or
+                      self.shadow_keyframe_method == "waft")
+        if needs_waft and not self.waft_ckpt_path:
+            _mod_dir = os.path.dirname(os.path.abspath(__file__))
+            _default = os.path.join(_mod_dir, "3rdParty", "WAFT", "ckpts", "tar-c-t.pth")
+            if os.path.isfile(_default):
+                self.waft_ckpt_path = _default
 
 
 class Pi3xSLAM:
@@ -125,13 +135,13 @@ class Pi3xSLAM:
         log_dir = next((d for d in self.run_dirs.values() if d), None)
         self.logger = setup_mod_logger("essn_slam", log_dir=log_dir)
 
-        # Keyframe selector (LK or WAFT) -- one tracker per view
         self.keyframe_selector = KeyframeSelector(
             method=config.keyframe_method,
             waft_ckpt=config.waft_ckpt_path,
             device=config.device,
             debug_dir=config.kf_debug_dir,
             view_keys=view_keys or [],
+            shadow_method=config.shadow_keyframe_method,
         )
 
         # Submap processor (Pi3X model, graph, loop closure, viewer)
@@ -306,6 +316,16 @@ class Pi3xSLAM:
         if total_images > 0:
             print(f"  Avg Pi3X inference/image: {sp.inference_timer.total_time / total_images:.4f}s")
             print(f"  Avg FPS (images): {total_images / total_time:.2f}")
+
+        kf_agreement = self.keyframe_selector.get_agreement_stats()
+        if kf_agreement:
+            print(f"  --- Keyframe agreement ({kf_agreement['primary_method']} vs {kf_agreement['shadow_method']} shadow) ---")
+            print(f"    Total timestamps: {kf_agreement['total_timestamps']}")
+            print(f"    Both KF: {kf_agreement['agree_kf']}   "
+                  f"Both skip: {kf_agreement['agree_skip']}   "
+                  f"{kf_agreement['primary_method']}-only KF: {kf_agreement['primary_only_kf']}   "
+                  f"{kf_agreement['shadow_method']}-only KF: {kf_agreement['shadow_only_kf']}")
+            print(f"    Agreement: {kf_agreement['agreement_pct']}%")
         print(f"{'='*60}")
 
         # Pipeline-level profiling summary
@@ -323,6 +343,8 @@ class Pi3xSLAM:
         self.report.set_metric("loop_closures", sp.graph.get_num_loops())
         self.report.set_metric("total_time_s", total_time)
         self.report.set_metric("keyframe_method", self.config.keyframe_method)
+        if kf_agreement:
+            self.report.set_metric("keyframe_agreement", kf_agreement)
         if total_images > 0:
             self.report.set_metric("avg_inference_per_image_s",
                                    sp.inference_timer.total_time / total_images)

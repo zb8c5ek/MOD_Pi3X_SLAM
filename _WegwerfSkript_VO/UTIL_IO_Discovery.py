@@ -125,6 +125,37 @@ def _discover_flat_cam(data_root, cameras, camera_angles, stride):
     return view_file_lists if view_file_lists else None
 
 
+CAM_DIR_RE = re.compile(r'^cam\d+$')
+
+def _discover_nested_cam(data_root, cameras, camera_angles, stride):
+    """Layout D: camN/ORIENTATION/*.jpg -- nested cam dirs from undistort output."""
+    view_file_lists: Dict[str, List[Path]] = {}
+
+    for cam_dir in sorted(data_root.iterdir()):
+        if not cam_dir.is_dir() or not CAM_DIR_RE.match(cam_dir.name):
+            continue
+        cam_id = cam_dir.name
+        if cam_id not in cameras:
+            continue
+        for orient_dir in sorted(cam_dir.iterdir()):
+            if not orient_dir.is_dir():
+                continue
+            orientation = orient_dir.name
+            if not _matches_filter(cam_id, orientation, cameras, camera_angles):
+                continue
+            view_key = f"{cam_id}_{orientation}"
+            files = sorted([
+                f for f in orient_dir.iterdir()
+                if f.is_file() and f.suffix.lower() in IMAGE_EXTS
+            ])
+            files = files[::stride]
+            if files:
+                view_file_lists[view_key] = files
+                print(f"  {view_key}: {len(files)} images")
+
+    return view_file_lists if view_file_lists else None
+
+
 def _interleave(view_file_lists):
     """Interleave images by index across all views for temporal consistency."""
     view_keys = sorted(view_file_lists.keys())
@@ -166,6 +197,11 @@ def discover_images(
 
     # Layout A: group_XXX/camN/orientation/
     view_files = _discover_grouped(data_root, cameras, camera_angles, stride)
+    if view_files:
+        return _interleave(view_files)
+
+    # Layout D: camN/orientation/ (nested cam dirs from undistort)
+    view_files = _discover_nested_cam(data_root, cameras, camera_angles, stride)
     if view_files:
         return _interleave(view_files)
 
@@ -221,10 +257,12 @@ def discover_timestamps(
 
     view_files = _discover_grouped(data_root, cameras, camera_angles, stride)
     if view_files is None:
+        view_files = _discover_nested_cam(data_root, cameras, camera_angles, stride)
+    if view_files is None:
         view_files = _discover_flat_cam(data_root, cameras, camera_angles, stride)
     if view_files is None:
         raise ValueError(
-            f"discover_timestamps requires multi-view layout (A or B) in {data_root}"
+            f"discover_timestamps requires multi-view layout (A, B, or D) in {data_root}"
         )
 
     view_keys = sorted(view_files.keys())

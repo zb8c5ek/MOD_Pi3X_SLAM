@@ -17,7 +17,13 @@ Output layout::
     ├── pipeline_report.json
     └── episode_{name}/
         ├── grouping_manifest.json
-        └── _vo_results/run_{datetime}/
+        ├── group_000/                          <-- staged images (all cams+angles)
+        │   ├── cam0/p+0_y+30_r+0/*.jpg
+        │   ├── cam1/p+0_y-30_r+0/*.jpg
+        │   └── ...
+        ├── group_001/
+        │   └── ...
+        └── _vo_results/                        <-- VO reconstructions
             ├── group_000/sparse/0/{cameras,images,points3D}.txt
             ├── group_001/sparse/0/...
             └── ...
@@ -187,9 +193,8 @@ def _create_episode_output(vo_output_dir: Path, episode_name: str) -> Tuple[Path
     Returns:
         (episode_dir, vo_results_dir)
     """
-    run_ts = datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
     episode_dir = vo_output_dir / episode_name
-    vo_results_dir = episode_dir / "_vo_results" / run_ts
+    vo_results_dir = episode_dir / "_vo_results"
     vo_results_dir.mkdir(parents=True, exist_ok=True)
     return episode_dir, vo_results_dir
 
@@ -226,6 +231,12 @@ def _build_slam_config(
     use_lc = slam_features.get('loop_closure', True)
     use_viewer = slam_features.get('viewer', False)
 
+    keyframe_cfg = vo_cfg.get('keyframe', {})
+    kf_method = keyframe_cfg.get('method', 'waft')
+    waft_ckpt = keyframe_cfg.get('waft_ckpt_path') or paths.get('waft_ckpt_path', '')
+    shadow_method = keyframe_cfg.get('shadow_method', 'lk')
+    min_disparity = keyframe_cfg.get('min_disparity', 50.0)
+
     return SLAMConfig(
         ckpt_path=paths.get('ckpt_path', ''),
         device=device,
@@ -236,14 +247,16 @@ def _build_slam_config(
         max_submaps=0,
         conf_threshold=conf_threshold,
         conf_min_abs=0.0,
-        keyframe_method='lk',
+        keyframe_method=kf_method,
+        waft_ckpt_path=waft_ckpt or None,
         use_keyframe_selection=use_kf,
-        min_disparity=50.0,
+        min_disparity=min_disparity,
+        shadow_keyframe_method=shadow_method or None,
         max_loops=1 if use_lc else 0,
         lc_retrieval_threshold=0.95,
         lc_conf_threshold=0.25,
         sim3_inlier_thresh=0.5,
-        viewer_port=8080,
+        viewer_port=8080 if use_viewer else 0,
         viewer_max_points=0,
         output_dir=str(vo_results_dir),
         shared_intrinsics=shared_K,
@@ -255,26 +268,173 @@ def _build_slam_config(
 # Grouping manifest + pipeline report
 # ============================================================================
 
+_FRAME_IDX_RE = re.compile(r"^(\d{6})_")
+
+
+def _extract_frame_indices(img_paths: List[str]) -> List[int]:
+    """Extract sorted unique frame indices from image filenames."""
+    indices = set()
+    for p in img_paths:
+        m = _FRAME_IDX_RE.match(os.path.basename(p))
+        if m:
+            indices.add(int(m.group(1)))
+    return sorted(indices)
+
+
+def _stage_group_images(
+    episode_out_dir: Path,
+    undistort_dir: Path,
+    exported_groups: list,
+    use_symlinks: bool = True,
+) -> Dict[str, Dict]:
+    """Stage ALL camera/angle images for each group from EPISODING.
+
+    Creates the image layout expected by downstream MODs::
+
+        episode_out_dir/group_NNN/cam0/p+0_y+30_r+0/000002_..._cam0_p+0_y+30_r+0.jpg
+        episode_out_dir/group_NNN/cam1/...
+
+    Args:
+        episode_out_dir:  Episode directory in VO-EPISODING.
+        undistort_dir:    undistort_fov*/ directory from EPISODING.
+        exported_groups:  From export_per_submap_colmap: (idx, dir, img_paths).
+        use_symlinks:     Use symlinks (True) or file copies (False).
+
+    Returns:
+        Dict keyed by group name, each value a dict with ``frame_indices``
+        and ``files`` (camera -> angle -> [filename, ...]).
+    """
+    cameras = sorted(
+        d.name for d in undistort_dir.iterdir()
+        if d.is_dir() and d.name.startswith("cam")
+    )
+    angles_per_cam: Dict[str, List[str]] = {}
+    for cam in cameras:
+        cam_dir = undistort_dir / cam
+        angles_per_cam[cam] = sorted(
+            d.name for d in cam_dir.iterdir() if d.is_dir()
+        )
+
+    all_files_by_frame: Dict[int, Dict[str, Dict[str, str]]] = {}
+    for cam in cameras:
+        for angle in angles_per_cam[cam]:
+            angle_dir = undistort_dir / cam / angle
+            for img in angle_dir.iterdir():
+                if not img.is_file():
+                    continue
+                m = _FRAME_IDX_RE.match(img.name)
+                if not m:
+                    continue
+                fidx = int(m.group(1))
+                all_files_by_frame.setdefault(fidx, {}).setdefault(cam, {})[angle] = img
+
+    staging_info: Dict[str, Dict] = {}
+
+    for group_idx, _group_dir, img_full_paths in exported_groups:
+        group_name = f"group_{group_idx:03d}"
+        frame_indices = _extract_frame_indices(img_full_paths)
+
+        group_out = episode_out_dir / group_name
+        files_manifest: Dict[str, Dict[str, List[str]]] = {}
+        n_staged = 0
+
+        for fidx in frame_indices:
+            cam_files = all_files_by_frame.get(fidx, {})
+            for cam in cameras:
+                angle_files = cam_files.get(cam, {})
+                for angle in angles_per_cam[cam]:
+                    src = angle_files.get(angle)
+                    if src is None:
+                        continue
+                    dst_dir = group_out / cam / angle
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+                    dst = dst_dir / src.name
+
+                    if dst.exists():
+                        continue
+
+                    if use_symlinks:
+                        try:
+                            dst.symlink_to(src)
+                        except OSError:
+                            import shutil
+                            shutil.copy2(str(src), str(dst))
+                    else:
+                        import shutil
+                        shutil.copy2(str(src), str(dst))
+                    n_staged += 1
+
+                    files_manifest.setdefault(cam, {}).setdefault(angle, []).append(src.name)
+
+        for cam in files_manifest:
+            for angle in files_manifest[cam]:
+                files_manifest[cam][angle].sort()
+
+        staging_info[group_name] = {
+            "frame_indices": frame_indices,
+            "files": files_manifest,
+            "num_frames": len(frame_indices),
+        }
+        logger.info("  [Stage] %s: %d frames, %d images staged", group_name, len(frame_indices), n_staged)
+
+    return staging_info
+
+
 def _write_grouping_manifest(
     episode_dir: Path,
     exported_groups: list,
+    staging_info: Dict[str, Dict],
+    undistort_dir: Optional[Path],
     image_paths: list,
     group_size: int,
     overlap: int,
+    stride: int,
 ):
-    """Write grouping_manifest.json for an episode."""
+    """Write grouping_manifest.json matching the reference v110 format."""
+    cameras = []
+    poses = []
+    if undistort_dir and undistort_dir.is_dir():
+        cameras = sorted(
+            d.name for d in undistort_dir.iterdir()
+            if d.is_dir() and d.name.startswith("cam")
+        )
+        if cameras:
+            first_cam = undistort_dir / cameras[0]
+            poses = sorted(
+                d.name for d in first_cam.iterdir() if d.is_dir()
+            )
+
     groups = []
-    for group_idx, group_dir in exported_groups:
-        groups.append({
-            "group_name": f"group_{group_idx:03d}",
-            "group_dir": str(group_dir),
-            "group_size": group_size,
-        })
+    for group_idx, group_dir, img_full_paths in exported_groups:
+        group_name = f"group_{group_idx:03d}"
+        info = staging_info.get(group_name, {})
+        frame_indices = info.get("frame_indices", [])
+
+        entry = {
+            "name": group_name,
+            "position_start": 0 if not frame_indices else 0,
+            "position_end": len(frame_indices) - 1 if frame_indices else 0,
+            "frame_start": frame_indices[0] if frame_indices else 0,
+            "frame_end": frame_indices[-1] if frame_indices else 0,
+            "frame_indices": frame_indices,
+            "num_frames": len(frame_indices),
+            "files": info.get("files", {}),
+        }
+        groups.append(entry)
 
     manifest = {
-        "total_images": len(image_paths),
-        "group_size": group_size,
-        "overlap_frames": overlap,
+        "episode": episode_dir.name,
+        "source_undistort": undistort_dir.name if undistort_dir else "",
+        "source_path": str(undistort_dir) if undistort_dir else "",
+        "created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "config": {
+            "group_size": group_size,
+            "overlap_frames": overlap,
+            "stride_frame": stride,
+        },
+        "cameras": cameras,
+        "poses": poses,
+        "total_frames": len(image_paths),
         "num_groups": len(groups),
         "groups": groups,
     }
@@ -439,7 +599,20 @@ def run_pipeline(config_path: str) -> int:
             str(vo_results_dir), sp.map, sp.graph, shared_K=shared_K)
         logger.info("Exported %d groups", len(exported_groups))
 
-        # 5g. Write grouping manifest
+        # 5g. Stage all camera/angle images per group from EPISODING
+        use_symlinks = vo_cfg.get('output', {}).get('use_symlinks', True)
+        undistort_dir = image_root  # from step 5a
+        staging_info = {}
+        if undistort_dir and undistort_dir.is_dir():
+            logger.info("Staging group images from %s", undistort_dir)
+            staging_info = _stage_group_images(
+                episode_out, undistort_dir, exported_groups,
+                use_symlinks=use_symlinks,
+            )
+        else:
+            logger.warning("Undistort dir not found; skipping image staging")
+
+        # 5h. Write grouping manifest (rich format)
         all_paths = []
         if is_multi_view:
             for ts in timestamps:
@@ -447,7 +620,9 @@ def run_pipeline(config_path: str) -> int:
         else:
             all_paths = view_keys_or_paths
         _write_grouping_manifest(
-            episode_out, exported_groups, all_paths, group_size, overlap)
+            episode_out, exported_groups, staging_info,
+            undistort_dir, all_paths,
+            group_size, overlap, stride)
 
         episodes_processed.append({
             "name": episode_name,

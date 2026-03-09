@@ -211,7 +211,9 @@ def export_per_submap_colmap(vo_results_dir, map_store, graph, shared_K=None,
         max_export_pts: Max points per group before subsampling.
 
     Returns:
-        List of (group_idx, group_dir) tuples that were exported.
+        List of (group_idx, group_dir, img_full_paths) tuples.
+        img_full_paths are the original full image paths from the submap,
+        needed by callers for image staging and manifest generation.
     """
     if not vo_results_dir:
         return []
@@ -228,7 +230,8 @@ def export_per_submap_colmap(vo_results_dir, map_store, graph, shared_K=None,
         os.makedirs(sparse_dir, exist_ok=True)
 
         poses_world = submap.get_all_poses_world(graph)
-        img_names = [os.path.basename(n) for n in submap.img_names]
+        img_full_paths = list(submap.img_names)
+        img_names = [os.path.basename(n) for n in img_full_paths]
 
         points = submap.get_points_in_world_frame(graph)
         colors = submap.get_points_colors()
@@ -250,7 +253,8 @@ def export_per_submap_colmap(vo_results_dir, map_store, graph, shared_K=None,
         write_colmap_txt(sparse_dir, poses_world, img_names, points, colors,
                          H, W, shared_K=shared_K)
 
-        exported.append((group_idx, os.path.join(vo_results_dir, group_name)))
+        exported.append((group_idx, os.path.join(vo_results_dir, group_name),
+                         img_full_paths))
         print(f"  [VO Export] {group_name}: {len(poses_world)} images, "
               f"{len(points)} points -> {sparse_dir}")
         group_idx += 1

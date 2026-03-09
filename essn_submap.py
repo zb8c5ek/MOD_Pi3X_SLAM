@@ -116,7 +116,7 @@ class SubmapProcessor:
         print(f"Pi3X model loaded in {load_time:.2f}s")
 
         # SLAM components
-        self.viewer = Viewer(port=viewer_port)
+        self.viewer = Viewer(port=viewer_port) if viewer_port else None
         self.map = GraphMap()
         self.graph = PoseGraph(mode=alignment_mode)
         self.image_retrieval = ImageRetrieval(device=device)
@@ -144,6 +144,8 @@ class SubmapProcessor:
     # ------------------------------------------------------------------
 
     def _set_point_cloud(self, points, colors, name, point_size):
+        if not self.viewer:
+            return
         if self.vis_voxel_size is not None:
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
@@ -159,6 +161,8 @@ class SubmapProcessor:
         self.viewer.point_cloud_handles[pcd_name] = handle
 
     def _set_submap_point_cloud(self, submap):
+        if not self.viewer:
+            return
         try:
             points = submap.get_points_in_world_frame(self.graph)
             colors = submap.get_points_colors()
@@ -188,6 +192,8 @@ class SubmapProcessor:
             import traceback; traceback.print_exc()
 
     def _set_submap_poses(self, submap):
+        if not self.viewer:
+            return
         try:
             extrinsics = submap.get_all_poses_world(self.graph)
             images = submap.get_all_frames()

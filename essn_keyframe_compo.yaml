@@ -9,13 +9,19 @@
 # =============================================================================
 
 # -- Backend selection --------------------------------------------------------
+# "waft" — WAFT dense optical flow (GPU, requires checkpoint). Default.
 # "lk"   — Lucas-Kanade sparse optical flow (CPU, no model loading)
-# "waft" — WAFT dense optical flow (GPU, requires checkpoint)
-keyframe_method: "lk"
+keyframe_method: "waft"
 
 # Path to WAFT checkpoint. Required when keyframe_method = "waft".
 # Download: https://drive.google.com/file/d/1CxzBQx0iSg6AyIgt6MF0ROlF_cAeZLPC
 waft_ckpt_path: null
+
+# -- Shadow comparison -------------------------------------------------------
+# Run a second backend alongside the primary for agreement analysis.
+# The shadow backend observes every frame but does NOT drive decisions.
+# null = disabled.
+shadow_keyframe_method: "lk"
 
 # -- Debug output -------------------------------------------------------------
 # Directory for keyframe selection debug images (4-panel: ref|current|flow|bar).
