@@ -95,7 +95,7 @@ class SLAMConfig:
     # Output
     colmap_output_path: Optional[str] = None
     log_poses_path: Optional[str] = None
-    output_dir: Optional[str] = None  # when set, RUN_{datetime} is created under it and all outputs go inside
+    output_dir: Optional[str] = None  # when set, all outputs go directly here (no automatic subfolder)
 
     # Shared intrinsics from upstream undistortion step (3x3 numpy or None)
     shared_intrinsics: Optional[object] = None
@@ -177,10 +177,14 @@ class Pi3xSLAM:
     _FILE_ATTRS = {"log_poses_path"}
 
     def _stamp_output_dirs(self):
-        """Create RUN_{datetime} for traceability. When output_dir is set, one run folder contains all outputs."""
+        """Set up output directories.
+
+        When output_dir is given, write directly there -- caller owns the path.
+        Otherwise fall back to appending RUN_{datetime} to each individual path.
+        """
         c = self.config
         if getattr(c, "output_dir", None):
-            run_root = os.path.join(c.output_dir, self.run_id)
+            run_root = c.output_dir
             for attr, subdir in (
                 ("kf_debug_dir", "kf_debug"),
                 ("stitch_debug_dir", "stitch_debug"),

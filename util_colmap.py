@@ -273,3 +273,182 @@ def export_poses(log_poses_path, map_store, graph):
     if not log_poses_path:
         return
     map_store.write_poses_to_file(log_poses_path, graph)
+
+
+# ---------------------------------------------------------------------------
+# Scene graph + keyframe manifest export
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_FRAME_IDX_RE = _re.compile(r"^(\d{6})_")
+_TIMESTAMP_NS_RE = _re.compile(r"^\d+_\d+_(\d+)_cam")
+
+
+def _parse_image_meta(basename):
+    """Extract frame_idx and timestamp_ns from an image basename."""
+    fidx = ts_ns = None
+    m = _FRAME_IDX_RE.match(basename)
+    if m:
+        fidx = int(m.group(1))
+    m = _TIMESTAMP_NS_RE.match(basename)
+    if m:
+        ts_ns = int(m.group(1))
+    return fidx, ts_ns
+
+
+def export_slam_scene_graph(map_store, graph, stitch_records=None):
+    """Export the full SLAM scene graph organised by submap.
+
+    Each submap entry carries its keyframes with:
+      - frame index, timestamp (ns), origin file path
+      - cam2world pose in both submap-local and global frame
+
+    Edges are: intra-submap sequential, inter-submap overlap, loop closure.
+    Registration quality comes from ``stitch_records``.
+
+    Args:
+        map_store: GraphMap with all submaps.
+        graph: PoseGraph with optimised transforms.
+        stitch_records: List of stitch record dicts
+            (from ``kern_stitch_sim3.make_stitch_record``).
+
+    Returns:
+        Serialisable dict.
+    """
+    submaps_out = []
+    group_idx = 0
+    submap_id_to_group = {}
+    lc_submaps = []
+    img_name_to_submap = {}
+
+    for submap in map_store.ordered_submaps_by_key():
+        sid = submap.get_id()
+        if submap.get_lc_status():
+            lc_submaps.append(submap)
+            continue
+
+        group_name = f"group_{group_idx:03d}"
+        submap_id_to_group[sid] = group_name
+
+        poses_world = submap.get_all_poses_world(graph)
+        poses_local = submap.get_all_poses()
+
+        keyframes = []
+        for i, img_path in enumerate(submap.img_names):
+            basename = os.path.basename(img_path)
+            fidx, ts_ns = _parse_image_meta(basename)
+
+            pose_g = poses_world[i].tolist() if i < len(poses_world) else None
+            pose_l = (poses_local[i].tolist()
+                      if poses_local is not None and i < len(poses_local)
+                      else None)
+
+            keyframes.append({
+                "index_in_submap": i,
+                "frame_idx": fidx,
+                "timestamp_ns": ts_ns,
+                "image_name": basename,
+                "origin_path": str(img_path),
+                "pose_cam2world_global": pose_g,
+                "pose_cam2world_local": pose_l,
+            })
+            img_name_to_submap[basename] = (group_name, sid, fidx)
+
+        submaps_out.append({
+            "submap_id": sid,
+            "group": group_name,
+            "num_keyframes": len(keyframes),
+            "keyframes": keyframes,
+        })
+        group_idx += 1
+
+    # ── KF edges ──
+
+    kf_edges = []
+
+    # Intra-submap: consecutive KFs share the Pi3X reconstruction.
+    for sm in submaps_out:
+        kfs = sm["keyframes"]
+        for i in range(len(kfs) - 1):
+            kf_edges.append({
+                "type": "sequential",
+                "kf_a": kfs[i]["frame_idx"],
+                "kf_b": kfs[i + 1]["frame_idx"],
+                "submap_id": sm["submap_id"],
+                "group": sm["group"],
+            })
+
+    # Inter-submap overlap: shared image basenames.
+    for i in range(len(submaps_out) - 1):
+        sa, sb = submaps_out[i], submaps_out[i + 1]
+        names_a = {kf["image_name"] for kf in sa["keyframes"]}
+        shared = [kf for kf in sb["keyframes"] if kf["image_name"] in names_a]
+        if shared:
+            kf_edges.append({
+                "type": "overlap",
+                "group_a": sa["group"],
+                "group_b": sb["group"],
+                "submap_a": sa["submap_id"],
+                "submap_b": sb["submap_id"],
+                "shared_frame_indices": sorted({kf["frame_idx"] for kf in shared}),
+                "num_shared": len(shared),
+            })
+
+    # Loop closure: trace LC submaps to their connected non-LC submaps.
+    lc_edges = []
+    for lc_sub in lc_submaps:
+        connections = []
+        for name in lc_sub.img_names:
+            bn = os.path.basename(name)
+            if bn in img_name_to_submap:
+                connections.append(img_name_to_submap[bn])
+        if len(connections) >= 2:
+            lc_edge = {
+                "type": "loop_closure",
+                "group_a": connections[0][0],
+                "group_b": connections[1][0],
+                "submap_a": connections[0][1],
+                "submap_b": connections[1][1],
+                "kf_a": connections[0][2],
+                "kf_b": connections[1][2],
+                "lc_submap_id": lc_sub.get_id(),
+            }
+            lc_edges.append(lc_edge)
+            kf_edges.append(lc_edge)
+
+    # ── Registration quality ──
+
+    registration = []
+    if stitch_records:
+        for rec in stitch_records:
+            registration.append({
+                "edge": rec.get("edge", ""),
+                "is_loop_closure": rec.get("is_lc", False),
+                "submap_prev": rec.get("submap_prev"),
+                "submap_curr": rec.get("submap_curr"),
+                "group_prev": submap_id_to_group.get(rec.get("submap_prev"), ""),
+                "group_curr": submap_id_to_group.get(rec.get("submap_curr"), ""),
+                "sim3_scale": rec.get("sim3_s"),
+                "kabsch_rmsd": rec.get("kabsch_rmsd"),
+                "rotation_deg": rec.get("rot_deg"),
+                "translation_norm": rec.get("t_norm"),
+                "num_inliers": rec.get("inliers"),
+                "total_points": rec.get("total_pts"),
+                "backend": rec.get("backend"),
+            })
+
+    return {
+        "submaps": submaps_out,
+        "kf_edges": kf_edges,
+        "loop_closures": lc_edges,
+        "registration": registration,
+        "summary": {
+            "num_submaps": len(submaps_out),
+            "num_kf_edges": len(kf_edges),
+            "num_loop_closures": len(lc_edges),
+            "num_submaps_total": map_store.get_num_submaps(),
+            "num_graph_nodes": graph.get_num_nodes(),
+            "num_graph_loops": graph.get_num_loops(),
+        },
+    }

@@ -1,0 +1,26 @@
+# =============================================================================
+# essn_compo_vo.yaml -- VO Data Organisation Component Config
+# =============================================================================
+# Tunable parameters for essn_vo (temporal grouping + image staging).
+# See CLAUDE.md Section 2A for essn_compo conventions.
+
+# Temporal grouping: split each episode into fixed-size chunks with overlap.
+# These groups define the per-group COLMAP reconstructions consumed by
+# downstream MODs (MOD_KabschAnalyzer, MOD_InterGroupPoseEstimation).
+grouping:
+  group_size: 5            # timestamps per group (maps to submap_size in SLAM)
+  overlap_frames: 1        # overlapping timestamps between adjacent groups
+  stride_frame: 2          # frame stride (1 = every frame, 2 = every other)
+  keyframe_window: 3       # ±K SLAM keyframes to extend each group for submap anchor alignment
+
+# Image staging: copy or symlink undistorted images into per-group folders.
+staging:
+  use_symlinks: false      # true = symlink, false = copy (safer on Windows / Docker)
+
+# Shared intrinsics from upstream undistortion step (MOD_EpisodeEnUndistort).
+# When enabled, the real post-undistortion K matrix is used for COLMAP export
+# instead of the heuristic focal = max(H, W) * 1.2.
+shared_intrinsics:
+  enabled: true
+  source: "auto"           # "auto" = find undistorted_intrinsics.yaml in EPISODING dir
+  path: null               # explicit YAML path (only when source="path")
