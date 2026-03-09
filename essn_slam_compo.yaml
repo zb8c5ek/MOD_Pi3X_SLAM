@@ -1,0 +1,49 @@
+# =============================================================================
+# essn_slam Component Config
+# =============================================================================
+# Tunable parameters for essn_slam.Pi3xSLAM — the top-level SLAM orchestrator.
+#
+# This ESSN wires essn_keyframe (keyframe selection) and essn_submap (submap
+# processing) together in the main run loop. It owns batching, run metadata,
+# and final export.
+# =============================================================================
+
+# -- Submap batching ----------------------------------------------------------
+# Number of NEW keyframes per submap batch.
+# Total frames sent to Pi3X = submap_size + overlap_window.
+submap_size: 16
+
+# Overlapping keyframes between adjacent submaps for scale alignment.
+# At least 1 is required for inter-submap stitching.
+overlap_window: 1
+
+# Max submaps to process (0 = unlimited). Useful for capping long sequences.
+max_submaps: 0
+
+# -- Keyframe selection -------------------------------------------------------
+# Whether to use keyframe selection at all. false = process every frame.
+use_keyframe_selection: true
+
+# Minimum optical flow displacement (pixels) to trigger a new keyframe.
+# Higher = fewer keyframes = faster but sparser coverage.
+min_disparity: 50.0
+
+# -- Alignment ----------------------------------------------------------------
+# Inter-submap alignment backend.
+#   "sim3" — 7-DoF SIM(3) via Umeyama + RANSAC (default, well-calibrated submaps)
+#   "sl4"  — 15-DoF SL(4) projective via DLT + RANSAC + LM (for uncalibrated submaps)
+alignment_mode: "sim3"
+
+# Run SL(4) as a shadow alongside the primary SIM(3) backend.
+# Prints comparison diagnostics without affecting the graph.
+shadow_sl4: true
+
+# -- Output -------------------------------------------------------------------
+# COLMAP text output directory (relative to data_root or absolute).
+colmap_output_path: null
+
+# Pose log file path. null = disabled.
+log_poses_path: null
+
+# Viser visualization port.
+viewer_port: 8080

@@ -1,0 +1,23 @@
+# =============================================================================
+# essn_keyframe Component Config
+# =============================================================================
+# Tunable parameters for essn_keyframe.KeyframeSelector — multi-view keyframe
+# selection API.
+#
+# Manages one optical-flow tracker per camera view. Evaluates per-view
+# disparity independently, then aggregates (max) to decide keyframe status.
+# =============================================================================
+
+# -- Backend selection --------------------------------------------------------
+# "lk"   — Lucas-Kanade sparse optical flow (CPU, no model loading)
+# "waft" — WAFT dense optical flow (GPU, requires checkpoint)
+keyframe_method: "lk"
+
+# Path to WAFT checkpoint. Required when keyframe_method = "waft".
+# Download: https://drive.google.com/file/d/1CxzBQx0iSg6AyIgt6MF0ROlF_cAeZLPC
+waft_ckpt_path: null
+
+# -- Debug output -------------------------------------------------------------
+# Directory for keyframe selection debug images (4-panel: ref|current|flow|bar).
+# null = disabled. When set, creates one subdirectory per view.
+kf_debug_dir: null

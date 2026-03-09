@@ -1,0 +1,32 @@
+# =============================================================================
+# essn_compo_vo_pipeline.yaml -- Pi3X SLAM / VO Pipeline Component Config
+# =============================================================================
+# Component-level config declaring tunable parameters for the Pi3X SLAM
+# module when running as the VO step (Step 2) in the LORDPIPE pipeline.
+#
+# This replaces the old MOD_Pi3X_VisualOdometry component config.
+
+# -- Shared Intrinsics -------------------------------------------------------
+# Use the known post-undistortion K matrix from Step 1 (MOD_EpisodeEnUndistort)
+# instead of Pi3X's heuristic focal = max(H,W)*1.2 for COLMAP cameras.txt.
+#
+# The undistorted K is:
+#   fx = fy = focal_scale * output_width   (focal_scale = 1/(2*tan(FOV/2)))
+#   cx = output_width / 2
+#   cy = output_height / 2
+#
+# This K is used for COLMAP export (cameras.txt), Submap.proj_mats, and
+# SL(4) alignment when that backend is active.  It does NOT affect Pi3X
+# inference or point cloud geometry.
+shared_intrinsics:
+  enabled: false          # true = use real K from upstream undistort step
+  source: "auto"          # "auto" = find undistorted_intrinsics.yaml in EPISODING dir
+  path: null              # explicit YAML path (only when source="path")
+
+# -- SLAM Enhancements (beyond vanilla VO) -----------------------------------
+# These features differentiate Pi3X-SLAM from the old batch VO module.
+slam_features:
+  keyframe_selection: true      # enable WAFT/LK keyframe filtering
+  loop_closure: true            # enable SALAD loop closure detection
+  pose_graph_optimization: true # enable GTSAM factor graph optimization
+  viewer: false                 # disable Viser viewer in pipeline mode

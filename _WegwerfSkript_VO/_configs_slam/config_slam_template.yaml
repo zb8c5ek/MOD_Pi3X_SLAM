@@ -1,0 +1,66 @@
+# =============================================================================
+# Pi3X SLAM Configuration Template
+# =============================================================================
+
+paths:
+    # Root directory containing camera subdirectories with images
+    data_root: "D:/_DataBuffer/YOUR_EPISODE_FOLDER"
+    # Path to Pi3X model checkpoint
+    ckpt_path: "D:/_HUBs/HuggingFace/Pi3X/model.safetensors"
+
+input:
+    # Camera IDs to include
+    cameras: ["cam0"]
+    # Per-camera orientation selection (omit to use all available)
+    camera_angles:
+        cam0: ["p+0_y+0_r+0"]
+    # Frame stride (1 = every frame, 2 = every other)
+    stride_frame: 1
+
+model:
+    device: "cuda"
+    # float16 for most GPUs; bfloat16 if compute capability >= 8
+    dtype: "float16"
+
+processing:
+    # Max pixels per image (controls resolution vs VRAM tradeoff)
+    pixel_limit: 255000
+    # Confidence percentile threshold: 50.0 = keep top 50% of points,
+    # 90.0 = keep only top 10% (very selective)
+    conf_threshold: 50.0
+    # Absolute sigmoid confidence floor (0.0-1.0). Points below this are
+    # always discarded regardless of percentile. 0.0 = disabled, 0.95 = very strict.
+    conf_min_abs: 0.0
+
+slam:
+    # Number of NEW keyframes per submap (total = submap_size + overlap_window)
+    submap_size: 16
+    # Overlapping keyframes between adjacent submaps (for scale alignment)
+    overlap_window: 1
+    # Max submaps to process (0 = unlimited). Caps long sequences.
+    max_submaps: 0
+    # Keyframe selection method: "lk" (Lucas-Kanade sparse) or "waft" (WAFT dense)
+    keyframe_method: "lk"
+    # Path to WAFT checkpoint (required when keyframe_method = "waft")
+    # Download from: https://drive.google.com/file/d/1CxzBQx0iSg6AyIgt6MF0ROlF_cAeZLPC
+    waft_ckpt_path: null
+    # Minimum optical flow displacement (pixels) to trigger new keyframe
+    min_disparity: 50.0
+    # Set false to disable keyframe selection (process every frame)
+    use_keyframe_selection: true
+    # Max loop closures per submap (0 = disabled)
+    max_loops: 1
+    # SALAD L2 distance threshold for loop closure candidate retrieval
+    # Lower = stricter matching. Range: [0, ~2.0]
+    lc_retrieval_threshold: 0.95
+    # Mean sigmoid confidence threshold for LC verification
+    # Higher = stricter. Range: [0, 1.0]
+    lc_conf_threshold: 0.25
+
+output:
+    # COLMAP text output (relative to data_root or absolute)
+    colmap_output_path: "_output_colmap"
+    # Pose log file path (null = disabled)
+    log_poses_path: null
+    # Viser visualization port
+    viewer_port: 8080

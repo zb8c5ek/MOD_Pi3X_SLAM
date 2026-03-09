@@ -1,0 +1,60 @@
+# =============================================================================
+# MOD Super Config — Pi3X SLAM Pipeline
+# =============================================================================
+# Module-level config that wires together ESSNs + kerns for standalone testing.
+# This is the default configuration; dataset-specific YAMLs in _configs_slam/
+# override fields as needed.
+#
+# Resolution order:
+#   mod_super.yaml (defaults) → config_slam_*.yaml (overrides) → CLI args
+# =============================================================================
+
+# -- Data paths ---------------------------------------------------------------
+paths:
+    data_root: null          # REQUIRED — root directory with image data
+    ckpt_path: null          # REQUIRED — Pi3X model checkpoint
+
+# -- Input specification ------------------------------------------------------
+input:
+    cameras: ["cam0"]        # Camera IDs to include
+    camera_angles: {}        # Per-camera orientation filter (empty = all)
+    stride_frame: 1          # Frame stride (1 = every frame)
+
+# -- Model settings -----------------------------------------------------------
+model:
+    device: "cuda"
+    dtype: "float16"
+
+# -- Image preprocessing (kern_inference) -------------------------------------
+processing:
+    pixel_limit: 255000
+    conf_threshold: 50.0
+    conf_min_abs: 0.0
+
+# -- SLAM pipeline (essn_slam) -----------------------------------------------
+slam:
+    # Submap batching
+    submap_size: 16
+    overlap_window: 1
+    max_submaps: 0
+
+    # Keyframe selection (essn_keyframe)
+    keyframe_method: "lk"
+    waft_ckpt_path: null
+    min_disparity: 50.0
+    use_keyframe_selection: true
+
+    # Loop closure (essn_submap → kern_loop_closure)
+    max_loops: 1
+    lc_retrieval_threshold: 0.95
+    lc_conf_threshold: 0.25
+
+    # Debug
+    kf_debug_dir: null
+    stitch_debug_dir: null
+
+# -- Output -------------------------------------------------------------------
+output:
+    colmap_output_path: null
+    log_poses_path: null
+    viewer_port: 8080
