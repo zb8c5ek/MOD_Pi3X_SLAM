@@ -18,6 +18,7 @@ actual keyframe decision.  After all timestamps have been processed, call
 """
 
 import os
+import time
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -102,6 +103,13 @@ class KeyframeSelector:
                 if self._shadow_method:
                     self._get_or_create_shadow_tracker(vk)
 
+        # Timing accumulators (seconds)
+        self._t_compute = 0.0
+        self._t_debug_write = 0.0
+        self._t_shadow = 0.0
+        self._t_set_kf = 0.0
+        self._n_calls = 0
+
         if debug_dir:
             print(f"[KF] Debug images -> {debug_dir}", flush=True)
         shadow_tag = f", shadow={self._shadow_method}" if self._shadow_method else ""
@@ -161,7 +169,10 @@ class KeyframeSelector:
         Returns:
             (is_keyframe, {view_key: disparity})
         """
-        # --- Primary trackers ---
+        self._n_calls += 1
+
+        # --- Primary trackers (compute_disparity) ---
+        t0 = time.perf_counter()
         disparities: Dict[str, float] = {}
         flow_vis_map: Dict[str, object] = {}
 
@@ -170,6 +181,9 @@ class KeyframeSelector:
             disp, flow_vis = tracker.compute_disparity(img, min_disparity)
             disparities[vk] = disp
             flow_vis_map[vk] = flow_vis
+
+        t1 = time.perf_counter()
+        self._t_compute += t1 - t0
 
         max_disp = max(disparities.values()) if disparities else 0.0
 
@@ -180,18 +194,24 @@ class KeyframeSelector:
         is_kf = first_timestamp or (max_disp > min_disparity)
 
         # Save primary debug images
+        t2 = time.perf_counter()
         for vk, img in view_images.items():
             tracker = self._trackers[vk]
             tracker.save_debug(img, disparities[vk], flow_vis_map[vk],
                                min_disparity, is_kf)
+        t3 = time.perf_counter()
+        self._t_debug_write += t3 - t2
 
         # Update primary reference on keyframe
         if is_kf:
+            t4 = time.perf_counter()
             for vk, img in view_images.items():
                 self._trackers[vk].set_keyframe(img)
+            self._t_set_kf += time.perf_counter() - t4
 
         # --- Shadow trackers ---
         if self._shadow_method:
+            t5 = time.perf_counter()
             shadow_disps: Dict[str, float] = {}
             for vk, img in view_images.items():
                 st = self._get_or_create_shadow_tracker(vk)
@@ -205,11 +225,11 @@ class KeyframeSelector:
             )
             shadow_is_kf = shadow_first or (shadow_max > min_disparity)
 
-            # Shadow trackers follow the PRIMARY cadence: update ref when
-            # primary says keyframe, so both stay in sync on reference frames.
             if is_kf:
                 for vk, img in view_images.items():
                     self._shadow_trackers[vk].set_keyframe(img)
+
+            self._t_shadow += time.perf_counter() - t5
 
             self._agreement_log.append({
                 "primary_kf": is_kf,
@@ -219,6 +239,23 @@ class KeyframeSelector:
             })
 
         return is_kf, disparities
+
+    def get_timing_summary(self) -> Dict:
+        """Return accumulated timing breakdown across all check_timestamp calls."""
+        total = self._t_compute + self._t_debug_write + self._t_shadow + self._t_set_kf
+        n = max(self._n_calls, 1)
+        return {
+            "n_calls": self._n_calls,
+            "compute_s": self._t_compute,
+            "debug_write_s": self._t_debug_write,
+            "shadow_s": self._t_shadow,
+            "set_kf_s": self._t_set_kf,
+            "total_tracked_s": total,
+            "avg_per_ts_ms": total / n * 1000,
+            "avg_compute_ms": self._t_compute / n * 1000,
+            "avg_debug_ms": self._t_debug_write / n * 1000,
+            "avg_shadow_ms": self._t_shadow / n * 1000,
+        }
 
     # ------------------------------------------------------------------
     # Agreement statistics

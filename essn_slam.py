@@ -60,6 +60,8 @@ class SLAMConfig:
     overlap_window: int = 1
     # Max submaps to process (0 = unlimited). Useful for long sequences.
     max_submaps: int = 0
+    # Max input timestamps to process (0 = unlimited). Truncates before KF selection.
+    max_timestamps: int = 0
 
     # Confidence filtering (percentile: e.g. 90.0 means keep top 10%)
     conf_threshold: float = 50.0
@@ -73,7 +75,8 @@ class SLAMConfig:
     min_disparity: float = 50.0
     use_keyframe_selection: bool = True
     shadow_keyframe_method: Optional[str] = "lk"  # run this backend alongside primary for comparison (None = off)
-    kf_debug_dir: Optional[str] = None    # save flow visualizations when set
+    kf_save_debug_images: bool = False    # write per-frame flow visualizations (slow — 6 JPEGs/ts)
+    kf_debug_dir: Optional[str] = None    # path auto-set when kf_save_debug_images=true
 
     # Loop closure
     max_loops: int = 1
@@ -136,16 +139,31 @@ class Pi3xSLAM:
         log_dir = next((d for d in self.run_dirs.values() if d), None)
         self.logger = setup_mod_logger("essn_slam", log_dir=log_dir)
 
+        self._view_keys = view_keys or []
+
+        # Phase 1 model: keyframe selector (WAFT/LK)
         self.keyframe_selector = KeyframeSelector(
             method=config.keyframe_method,
             waft_ckpt=config.waft_ckpt_path,
             device=config.device,
             debug_dir=config.kf_debug_dir,
-            view_keys=view_keys or [],
+            view_keys=self._view_keys,
             shadow_method=config.shadow_keyframe_method,
         )
 
-        # Submap processor (Pi3X model, graph, loop closure, viewer)
+        # Phase 2 model: deferred — created after KF selector is freed
+        self.submap_processor = None
+
+    def _init_submap_processor(self):
+        """Create the SubmapProcessor (loads Pi3X + SALAD to GPU).
+
+        Call this AFTER freeing the keyframe selector so only one
+        model family occupies GPU memory at a time.
+        """
+        if self.submap_processor is not None:
+            return
+        config = self.config
+        print("\n  [Phase 2 init] Loading Pi3X + SALAD models...", flush=True)
         self.submap_processor = SubmapProcessor(
             ckpt_path=config.ckpt_path,
             device=config.device,
@@ -169,6 +187,7 @@ class Pi3xSLAM:
             shared_intrinsics=config.shared_intrinsics,
             shared_intrinsics_hw=config.shared_intrinsics_hw,
         )
+        print("  [Phase 2 init] Models loaded.", flush=True)
 
     # ------------------------------------------------------------------
     # Run directory setup
@@ -186,17 +205,22 @@ class Pi3xSLAM:
         c = self.config
         if getattr(c, "output_dir", None):
             run_root = c.output_dir
-            for attr, subdir in (
-                ("kf_debug_dir", "kf_debug"),
+            dirs_to_create = [
                 ("stitch_debug_dir", "stitch_debug"),
                 ("colmap_output_path", "colmap"),
                 ("log_poses_path", "log_poses.txt"),
-            ):
+            ]
+            if c.kf_save_debug_images:
+                dirs_to_create.insert(0, ("kf_debug_dir", "kf_debug"))
+            for attr, subdir in dirs_to_create:
                 path = os.path.join(run_root, subdir)
                 setattr(c, attr, path)
                 self.run_dirs[attr] = path
         else:
-            for attr in ("kf_debug_dir", "stitch_debug_dir", "colmap_output_path", "log_poses_path"):
+            attrs = ["stitch_debug_dir", "colmap_output_path", "log_poses_path"]
+            if c.kf_save_debug_images:
+                attrs.insert(0, "kf_debug_dir")
+            for attr in attrs:
                 base = getattr(c, attr, None)
                 if base:
                     stamped = os.path.join(base, self.run_id)
@@ -254,13 +278,14 @@ class Pi3xSLAM:
         """
         n_ts = len(timestamps)
         kf_timestamps: List[Dict[str, str]] = []
-        progress_interval = max(1, n_ts // 20)
+        progress_interval = max(1, min(n_ts // 20, 50))
 
         print(f"\n{'='*60}", flush=True)
         print(f"Phase 1: Keyframe selection  ({n_ts} timestamps)", flush=True)
         print(f"{'='*60}", flush=True)
 
         t0 = time.time()
+        t_imread_total = 0.0
 
         if not self.config.use_keyframe_selection:
             print("  Keyframe selection disabled — using all timestamps", flush=True)
@@ -268,6 +293,7 @@ class Pi3xSLAM:
 
         for idx, ts in enumerate(timestamps):
             with pipeline_prof("keyframe_selection"):
+                t_rd0 = time.perf_counter()
                 view_images = {}
                 skip = False
                 for vk, path in ts.items():
@@ -278,6 +304,7 @@ class Pi3xSLAM:
                         skip = True
                         break
                     view_images[vk] = img
+                t_imread_total += time.perf_counter() - t_rd0
                 if skip:
                     continue
 
@@ -287,16 +314,50 @@ class Pi3xSLAM:
                     kf_timestamps.append(ts)
 
             if idx % progress_interval == 0 or idx == n_ts - 1:
+                elapsed_so_far = time.time() - t0
+                fps = (idx + 1) / max(elapsed_so_far, 0.001)
+                eta = (n_ts - idx - 1) / max(fps, 0.001)
                 print(f"  [KF select] ts {idx+1}/{n_ts}  "
                       f"kf={len(kf_timestamps)}  "
-                      f"({len(kf_timestamps)/max(idx+1,1)*100:.0f}% rate)",
+                      f"({len(kf_timestamps)/max(idx+1,1)*100:.0f}% rate)  "
+                      f"{fps:.1f} ts/s  ETA {eta:.0f}s",
                       flush=True)
 
         elapsed = time.time() - t0
+
+        # Profiling breakdown
+        n_views = len(timestamps[0]) if timestamps else 0
+        kf_timing = self.keyframe_selector.get_timing_summary()
+
         print(f"\n  Keyframe selection complete: "
               f"{len(kf_timestamps)}/{n_ts} timestamps selected "
               f"({len(kf_timestamps)/max(n_ts,1)*100:.1f}%) in {elapsed:.1f}s",
               flush=True)
+        print(f"\n  ---- KF Selection Profiling ({n_ts} ts x {n_views} views) ----",
+              flush=True)
+        print(f"  {'Stage':<22} {'Total':>8} {'Avg/ts':>10} {'%':>6}", flush=True)
+        print(f"  {'-'*50}", flush=True)
+
+        stages = [
+            ("imread", t_imread_total),
+            ("compute_disparity", kf_timing["compute_s"]),
+            ("debug_write", kf_timing["debug_write_s"]),
+            ("shadow_compute", kf_timing["shadow_s"]),
+            ("set_keyframe", kf_timing["set_kf_s"]),
+        ]
+        total_tracked = t_imread_total + kf_timing["total_tracked_s"]
+        for name, t_s in stages:
+            avg_ms = t_s / max(n_ts, 1) * 1000
+            pct = t_s / max(total_tracked, 0.001) * 100
+            print(f"  {name:<22} {t_s:>7.2f}s {avg_ms:>8.1f}ms {pct:>5.1f}%",
+                  flush=True)
+        overhead = elapsed - total_tracked
+        print(f"  {'overhead/other':<22} {overhead:>7.2f}s "
+              f"{overhead/max(n_ts,1)*1000:>8.1f}ms "
+              f"{overhead/max(elapsed,0.001)*100:>5.1f}%", flush=True)
+        print(f"  {'-'*50}", flush=True)
+        print(f"  {'TOTAL':<22} {elapsed:>7.2f}s "
+              f"{elapsed/max(n_ts,1)*1000:>8.1f}ms", flush=True)
 
         return kf_timestamps
 
@@ -320,6 +381,8 @@ class Pi3xSLAM:
 
     def _run_slam_on_keyframes(self, kf_timestamps, n_views, pipeline_prof):
         """Batch keyframes into submaps and run SLAM."""
+        self._init_submap_processor()
+
         submap_size = self.config.submap_size
         overlap = self.config.overlap_window
         target_kf_timestamps = submap_size + overlap
@@ -366,6 +429,11 @@ class Pi3xSLAM:
           Phase 1 — Select ALL keyframes upfront (WAFT/LK on GPU).
           Phase 2 — Free KF selector, run SLAM submaps (Pi3X + SALAD).
         """
+        if 0 < self.config.max_timestamps < len(timestamps):
+            print(f"[max_timestamps] Truncating {len(timestamps)} -> "
+                  f"{self.config.max_timestamps} timestamps", flush=True)
+            timestamps = timestamps[:self.config.max_timestamps]
+
         n_ts = len(timestamps)
         n_views = len(timestamps[0]) if timestamps else 0
         print(f"Starting Pi3X SLAM: {n_ts} timestamps x {n_views} views",
@@ -468,6 +536,8 @@ class Pi3xSLAM:
     def run(self, image_paths: List[str]):
         """Run on a flat list of image paths (single-view or pre-interleaved)."""
         from util_common import sort_images_by_number
+        self._init_submap_processor()
+
         print(f"Starting Pi3X SLAM on {len(image_paths)} images", flush=True)
         image_paths = sort_images_by_number(image_paths)
 

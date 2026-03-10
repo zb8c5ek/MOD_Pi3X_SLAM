@@ -224,6 +224,7 @@ def _build_slam_config(
         submap_size=slam.get('submap_size', 5),
         overlap_window=slam.get('overlap_window', 1),
         max_submaps=slam.get('max_submaps', 0),
+        max_timestamps=slam.get('max_timestamps', 0),
         conf_threshold=conf_threshold,
         conf_min_abs=conf_min_abs,
         keyframe_method=slam.get('keyframe_method', 'waft'),
@@ -235,6 +236,7 @@ def _build_slam_config(
         lc_retrieval_threshold=slam.get('lc_retrieval_threshold', 0.95),
         lc_conf_threshold=slam.get('lc_conf_threshold', 0.25),
         sim3_inlier_thresh=slam.get('sim3_inlier_thresh', 0.5),
+        kf_save_debug_images=slam.get('kf_save_debug_images', False),
         viewer_port=slam.get('viewer_port', 0),
         viewer_max_points=slam.get('viewer_max_points', 0),
         output_dir=str(slam_output_dir),
@@ -590,13 +592,12 @@ def run_pipeline(config_path: str) -> int:
     vo_stride = input_cfg.get('stride_frame', 1)
 
     # SLAM cameras (for reconstruction -- more angles for better coverage)
+    # SLAM always uses stride=1: keyframe selection handles frame decimation.
     slam_input_cfg = vo_cfg.get('slam_input', {})
     if slam_input_cfg:
         slam_cameras, slam_camera_angles = _parse_cameras(slam_input_cfg)
-        slam_stride = slam_input_cfg.get('stride_frame', 2)
     else:
         slam_cameras, slam_camera_angles = vo_cameras, vo_camera_angles
-        slam_stride = vo_stride
 
     group_size = grouping.get('group_size', 5)
     overlap = grouping.get('overlap_frames', 1)
@@ -604,8 +605,8 @@ def run_pipeline(config_path: str) -> int:
 
     logger.info("Input base: %s", input_base)
     logger.info("VO cameras: %s (stride=%d)", vo_cameras, vo_stride)
-    logger.info("SLAM cameras: %s, angles: %s (stride=%d)",
-                slam_cameras, slam_camera_angles, slam_stride)
+    logger.info("SLAM cameras: %s, angles: %s (stride=1, always)",
+                slam_cameras, slam_camera_angles)
     logger.info("Group size: %d, overlap: %d, kf_window: ±%d",
                 group_size, overlap, kf_window)
 
@@ -661,7 +662,7 @@ def run_pipeline(config_path: str) -> int:
         # 5b. Discover images for SLAM (multi-angle)
         timestamps, view_keys_or_paths, is_multi_view = \
             _discover_episode_images(
-                image_root, slam_cameras, slam_camera_angles, slam_stride)
+                image_root, slam_cameras, slam_camera_angles)
 
         if is_multi_view:
             n_images = sum(len(ts) for ts in timestamps)
@@ -766,7 +767,7 @@ def run_pipeline(config_path: str) -> int:
         write_grouping_manifest(
             vo_ep_out, exported_groups, staging_info,
             undistort_dir, all_paths,
-            group_size, overlap, stride,
+            group_size, overlap, vo_stride,
             kf_window=kf_window,
             kf_timeline=kf_timeline,
             registration_results=registration_results,
