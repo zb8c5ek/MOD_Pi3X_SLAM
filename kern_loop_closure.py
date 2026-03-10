@@ -68,14 +68,28 @@ class ImageRetrieval:
             pil_img = self.transform(tensor_transform(cv_img))
             return self.model(pil_img.to(self.device))
 
+    _SALAD_BATCH = 16
+
     def get_batch_descriptors(self, imgs):
         with torch.no_grad():
-            pil_imgs = [tensor_transform(img) for img in imgs]
-            imgs = torch.stack([self.transform(img) for img in pil_imgs])
-            return self.model(imgs.to(self.device))
+            pil_imgs = [self.transform(tensor_transform(img)) for img in imgs]
+            n = len(pil_imgs)
+            if n <= self._SALAD_BATCH:
+                batch = torch.stack(pil_imgs).to(self.device)
+                return self.model(batch)
+            all_descs = []
+            for i in range(0, n, self._SALAD_BATCH):
+                batch = torch.stack(pil_imgs[i:i + self._SALAD_BATCH]).to(self.device)
+                descs = self.model(batch)
+                all_descs.append(descs.cpu())
+                print(f"    [SALAD] {min(i + self._SALAD_BATCH, n)}/{n} embeddings",
+                      flush=True)
+            return torch.cat(all_descs, dim=0).to(self.device)
 
     def get_all_submap_embeddings(self, submap):
         frames = submap.get_all_frames()
+        print(f"    [SALAD] Computing embeddings for {len(frames)} frames...",
+              flush=True)
         return self.get_batch_descriptors(frames)
 
     def find_loop_closures(self, map, submap, max_similarity_thres=0.80, max_loop_closures=0):

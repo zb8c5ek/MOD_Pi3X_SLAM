@@ -240,73 +240,150 @@ class Pi3xSLAM:
     # Main run loop
     # ------------------------------------------------------------------
 
-    def run_timestamps(self, timestamps: List[Dict[str, str]]):
-        """Run the full SLAM pipeline on multi-view timestamp data.
+    # ------------------------------------------------------------------
+    # Phase 1: keyframe selection (upfront, full pass)
+    # ------------------------------------------------------------------
 
-        Each timestamp is a dict {view_key: image_path}.
-        Keyframe selection runs per-timestamp across all views.
-        When a timestamp is a keyframe, ALL view images are collected.
-        Submaps are batched by keyframe-timestamp count.
+    def _select_all_keyframes(self, timestamps, pipeline_prof):
+        """Run keyframe selection over ALL timestamps before SLAM.
+
+        Returns the list of keyframe timestamp dicts.
+        After this call the KeyframeSelector is no longer needed and the
+        caller can free its GPU memory.
         """
         n_ts = len(timestamps)
-        n_views = len(timestamps[0]) if timestamps else 0
-        print(f"Starting Pi3X SLAM: {n_ts} timestamps x {n_views} views", flush=True)
+        kf_timestamps: List[Dict[str, str]] = []
+        progress_interval = max(1, n_ts // 20)
 
+        print(f"\n{'='*60}", flush=True)
+        print(f"Phase 1: Keyframe selection  ({n_ts} timestamps)", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        t0 = time.time()
+
+        if not self.config.use_keyframe_selection:
+            print("  Keyframe selection disabled — using all timestamps", flush=True)
+            return list(timestamps)
+
+        for idx, ts in enumerate(timestamps):
+            with pipeline_prof("keyframe_selection"):
+                view_images = {}
+                skip = False
+                for vk, path in ts.items():
+                    img = cv2.imread(path)
+                    if img is None:
+                        print(f"Warning: could not read {path}, skipping ts",
+                              flush=True)
+                        skip = True
+                        break
+                    view_images[vk] = img
+                if skip:
+                    continue
+
+                is_kf, disps = self.keyframe_selector.check_timestamp(
+                    view_images, self.config.min_disparity)
+                if is_kf:
+                    kf_timestamps.append(ts)
+
+            if idx % progress_interval == 0 or idx == n_ts - 1:
+                print(f"  [KF select] ts {idx+1}/{n_ts}  "
+                      f"kf={len(kf_timestamps)}  "
+                      f"({len(kf_timestamps)/max(idx+1,1)*100:.0f}% rate)",
+                      flush=True)
+
+        elapsed = time.time() - t0
+        print(f"\n  Keyframe selection complete: "
+              f"{len(kf_timestamps)}/{n_ts} timestamps selected "
+              f"({len(kf_timestamps)/max(n_ts,1)*100:.1f}%) in {elapsed:.1f}s",
+              flush=True)
+
+        return kf_timestamps
+
+    def _free_keyframe_selector(self):
+        """Release the keyframe selector and its GPU memory."""
+        if hasattr(self, 'keyframe_selector') and self.keyframe_selector is not None:
+            kf_agreement = self.keyframe_selector.get_agreement_stats()
+            del self.keyframe_selector
+            self.keyframe_selector = None
+            import gc; gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print("  [GPU] Freed keyframe selector models", flush=True)
+            return kf_agreement
+        return None
+
+    # ------------------------------------------------------------------
+    # Phase 2: SLAM processing
+    # ------------------------------------------------------------------
+
+    def _run_slam_on_keyframes(self, kf_timestamps, n_views, pipeline_prof):
+        """Batch keyframes into submaps and run SLAM."""
         submap_size = self.config.submap_size
         overlap = self.config.overlap_window
         target_kf_timestamps = submap_size + overlap
-
-        kf_timestamps: List[Dict[str, str]] = []
-        kf_ts_count = 0
-        submap_count = 0
-        total_start = time.time()
-        keyframe_timer = Accumulator()
-        pipeline_prof = StageProfiler()
-
         sp = self.submap_processor
 
-        for idx, ts in enumerate(timestamps):
-            is_last = (idx == n_ts - 1)
+        n_kf = len(kf_timestamps)
+        print(f"\n{'='*60}", flush=True)
+        print(f"Phase 2: SLAM processing  "
+              f"({n_kf} kf-timestamps, submap_size={submap_size}, "
+              f"overlap={overlap})", flush=True)
+        print(f"{'='*60}", flush=True)
 
-            if self.config.use_keyframe_selection:
-                with pipeline_prof("keyframe_selection"):
-                    with keyframe_timer:
-                        view_images = {}
-                        skip = False
-                        for vk, path in ts.items():
-                            img = cv2.imread(path)
-                            if img is None:
-                                print(f"Warning: could not read {path}, skipping ts", flush=True)
-                                skip = True
-                                break
-                            view_images[vk] = img
-                        if skip:
-                            continue
+        submap_count = 0
+        batch: List[Dict[str, str]] = []
 
-                        is_kf, disps = self.keyframe_selector.check_timestamp(
-                            view_images, self.config.min_disparity)
-                        if is_kf:
-                            kf_timestamps.append(ts)
-                            kf_ts_count += 1
-            else:
-                kf_timestamps.append(ts)
-                kf_ts_count += 1
+        for i, ts in enumerate(kf_timestamps):
+            batch.append(ts)
 
-            if len(kf_timestamps) >= target_kf_timestamps or (is_last and kf_timestamps):
+            is_last = (i == n_kf - 1)
+            if len(batch) >= target_kf_timestamps or (is_last and batch):
                 submap_count += 1
-                all_paths = self._interleave_kf_timestamps(kf_timestamps)
-                n_kf_ts = len(kf_timestamps)
-                print(f"\n--- Submap {submap_count}: {n_kf_ts} kf-timestamps, "
+                all_paths = self._interleave_kf_timestamps(batch)
+                print(f"\n--- Submap {submap_count}: {len(batch)} kf-timestamps, "
                       f"{len(all_paths)} images ---", flush=True)
                 with pipeline_prof("submap_processing"):
                     sp.process_submap(all_paths)
-                kf_timestamps = kf_timestamps[-overlap:] if overlap > 0 else []
+                batch = batch[-overlap:] if overlap > 0 else []
 
                 if 0 < self.config.max_submaps <= submap_count:
-                    print(f"\nReached max_submaps limit ({self.config.max_submaps}).", flush=True)
+                    print(f"\nReached max_submaps limit "
+                          f"({self.config.max_submaps}).", flush=True)
                     break
 
+        return submap_count
+
+    # ------------------------------------------------------------------
+    # Main entry: two-phase run
+    # ------------------------------------------------------------------
+
+    def run_timestamps(self, timestamps: List[Dict[str, str]]):
+        """Run the full SLAM pipeline on multi-view timestamp data.
+
+        Two-phase execution:
+          Phase 1 — Select ALL keyframes upfront (WAFT/LK on GPU).
+          Phase 2 — Free KF selector, run SLAM submaps (Pi3X + SALAD).
+        """
+        n_ts = len(timestamps)
+        n_views = len(timestamps[0]) if timestamps else 0
+        print(f"Starting Pi3X SLAM: {n_ts} timestamps x {n_views} views",
+              flush=True)
+
+        total_start = time.time()
+        pipeline_prof = StageProfiler()
+
+        # Phase 1: keyframe selection (full pass)
+        kf_timestamps = self._select_all_keyframes(timestamps, pipeline_prof)
+        kf_agreement = self._free_keyframe_selector()
+
+        # Phase 2: SLAM processing
+        submap_count = self._run_slam_on_keyframes(
+            kf_timestamps, n_views, pipeline_prof)
+
+        # Summary
+        sp = self.submap_processor
         total_time = time.time() - total_start
+        kf_ts_count = len(kf_timestamps)
         total_images = kf_ts_count * n_views
 
         print(f"\n{'='*60}")
@@ -318,21 +395,24 @@ class Pi3xSLAM:
         print(f"  Loop closures: {sp.graph.get_num_loops()}")
         print(f"  Total time: {total_time:.2f}s")
         if total_images > 0:
-            print(f"  Avg Pi3X inference/image: {sp.inference_timer.total_time / total_images:.4f}s")
+            print(f"  Avg Pi3X inference/image: "
+                  f"{sp.inference_timer.total_time / total_images:.4f}s")
             print(f"  Avg FPS (images): {total_images / total_time:.2f}")
 
-        kf_agreement = self.keyframe_selector.get_agreement_stats()
         if kf_agreement:
-            print(f"  --- Keyframe agreement ({kf_agreement['primary_method']} vs {kf_agreement['shadow_method']} shadow) ---")
+            print(f"  --- Keyframe agreement "
+                  f"({kf_agreement['primary_method']} vs "
+                  f"{kf_agreement['shadow_method']} shadow) ---")
             print(f"    Total timestamps: {kf_agreement['total_timestamps']}")
             print(f"    Both KF: {kf_agreement['agree_kf']}   "
                   f"Both skip: {kf_agreement['agree_skip']}   "
-                  f"{kf_agreement['primary_method']}-only KF: {kf_agreement['primary_only_kf']}   "
-                  f"{kf_agreement['shadow_method']}-only KF: {kf_agreement['shadow_only_kf']}")
+                  f"{kf_agreement['primary_method']}-only KF: "
+                  f"{kf_agreement['primary_only_kf']}   "
+                  f"{kf_agreement['shadow_method']}-only KF: "
+                  f"{kf_agreement['shadow_only_kf']}")
             print(f"    Agreement: {kf_agreement['agreement_pct']}%")
         print(f"{'='*60}")
 
-        # Pipeline-level profiling summary
         pipeline_prof.print_summary("Pipeline")
 
         sp.export_colmap()
