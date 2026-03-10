@@ -302,6 +302,7 @@ class Pi3xSLAM:
 
     def _free_keyframe_selector(self):
         """Release the keyframe selector and its GPU memory."""
+        kf_agreement = None
         if hasattr(self, 'keyframe_selector') and self.keyframe_selector is not None:
             kf_agreement = self.keyframe_selector.get_agreement_stats()
             del self.keyframe_selector
@@ -310,8 +311,8 @@ class Pi3xSLAM:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print("  [GPU] Freed keyframe selector models", flush=True)
-            return kf_agreement
-        return None
+        self.kf_agreement = kf_agreement
+        return kf_agreement
 
     # ------------------------------------------------------------------
     # Phase 2: SLAM processing

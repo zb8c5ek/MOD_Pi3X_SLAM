@@ -773,7 +773,7 @@ def run_pipeline(config_path: str) -> int:
         )
 
         # 5m. Collect keyframe agreement stats
-        kf_agreement = slam.keyframe_selector.get_agreement_stats()
+        kf_agreement = getattr(slam, 'kf_agreement', None)
 
         # 5n. Read back manifest for the report
         manifest_path = vo_ep_out / "grouping_manifest.json"
