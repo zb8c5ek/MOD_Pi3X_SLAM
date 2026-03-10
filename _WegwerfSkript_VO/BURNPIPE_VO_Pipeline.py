@@ -336,6 +336,18 @@ def _export_slam_outputs(
 # Debug-lite output (git-friendly alignment diagnostics)
 # ============================================================================
 
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
 def _extract_sim3_scale(T_s):
     """Extract SIM3 scale from a 4x4 [sR,t;0,1] matrix."""
     sR = T_s[:3, :3]
@@ -368,17 +380,31 @@ def _write_debug_lite(slam_ep_out, sp, slam_config_dict=None):
 
     # ── 1. Config ──
     if slam_config_dict:
+        safe_cfg = {}
+        for k, v in slam_config_dict.items():
+            if isinstance(v, np.ndarray):
+                safe_cfg[k] = v.tolist()
+            elif hasattr(v, '__dict__'):
+                safe_cfg[k] = str(v)
+            else:
+                try:
+                    json.dumps(v)
+                    safe_cfg[k] = v
+                except (TypeError, ValueError):
+                    safe_cfg[k] = str(v)
         with open(lite_dir / "config.json", "w") as f:
-            json.dump(slam_config_dict, f, indent=2)
+            json.dump(safe_cfg, f, indent=2)
 
     # ── 2. Stitch records (raw from make_stitch_record) ──
+    _dump = lambda obj, fh: json.dump(obj, fh, indent=2, cls=_NumpyEncoder)
+
     with open(lite_dir / "stitch_records.json", "w") as f:
-        json.dump(sp.stitch_records, f, indent=2)
+        _dump(sp.stitch_records, f)
 
     shadow = getattr(sp, "shadow_records", None)
     if shadow:
         with open(lite_dir / "shadow_stitch_records.json", "w") as f:
-            json.dump(shadow, f, indent=2)
+            _dump(shadow, f)
 
     # ── 3. Per-submap T_s transforms + scale ──
     transforms = []
@@ -693,7 +719,12 @@ def run_pipeline(config_path: str) -> int:
                      sg["summary"]["num_kf_edges"],
                      sg["summary"]["num_loop_closures"])
 
-        # 5i. Dual-edge registration (kern_dual_edge)
+        # 5i. Debug-lite alignment diagnostics (git-friendly)
+        _write_debug_lite(slam_ep_out, sp,
+                          slam_config_dict=slam_config.__dict__
+                          if hasattr(slam_config, '__dict__') else None)
+
+        # 5j. Dual-edge registration (kern_dual_edge)
         kf_timeline = extract_kf_timeline(sg)
         kf_submap = kf_to_submap_map(sg)
         registration_results = {}
@@ -716,7 +747,7 @@ def run_pipeline(config_path: str) -> int:
                         "(groups=%d, kfs=%d)",
                         len(exported_groups), len(kf_timeline))
 
-        # 5j. Stage per-group images from EPISODING into VO/episode/ (VO cameras only)
+        # 5k. Stage per-group images from EPISODING into VO/episode/ (VO cameras only)
         undistort_dir = image_root
         staging_info = {}
         if undistort_dir and undistort_dir.is_dir():
@@ -731,7 +762,7 @@ def run_pipeline(config_path: str) -> int:
         else:
             logger.warning("Undistort dir not found; skipping image staging")
 
-        # 5k. Write grouping manifest with dual-edge data into VO/episode/
+        # 5l. Write grouping manifest with dual-edge data into VO/episode/
         write_grouping_manifest(
             vo_ep_out, exported_groups, staging_info,
             undistort_dir, all_paths,
@@ -741,17 +772,17 @@ def run_pipeline(config_path: str) -> int:
             registration_results=registration_results,
         )
 
-        # 5l. Collect keyframe agreement stats
+        # 5m. Collect keyframe agreement stats
         kf_agreement = slam.keyframe_selector.get_agreement_stats()
 
-        # 5m. Read back manifest for the report
+        # 5n. Read back manifest for the report
         manifest_path = vo_ep_out / "grouping_manifest.json"
         manifest_data = None
         if manifest_path.is_file():
             with open(manifest_path) as f:
                 manifest_data = json.load(f)
 
-        # 5n. Generate HTML summary at top level
+        # 5o. Generate HTML summary at top level
         logger.info("Generating pipeline_summary.html...")
         html_path = generate_pipeline_summary_html(
             output_dir=vo_output_dir,
