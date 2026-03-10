@@ -16,6 +16,7 @@ import time
 
 import cv2
 import numpy as np
+import torch
 
 from util_common import Accumulator, StageProfiler
 from util_report import ESSNReport, setup_mod_logger
