@@ -16,14 +16,15 @@ Output layout::
 
     VO-en-SLAM_EPISODING_{datetime}/
     ├── pipeline_report.json
-    └── episode_{name}/
-        ├── grouping_manifest.json
-        ├── group_000/                       <-- per-group (VO temporal)
-        │   ├── cam0/p+0_y+30_r+0/*.jpg
-        │   └── sparse/0/cameras,images,points3D.txt
-        ├── group_001/
-        │   └── ...
-        └── _slam/                           <-- SLAM keyframe submaps
+    ├── VO/                                  <-- VO temporal groups
+    │   └── episode_{name}/
+    │       ├── grouping_manifest.json
+    │       ├── group_000/
+    │       │   ├── cam0/p+0_y+30_r+0/*.jpg
+    │       │   └── sparse/0/cameras,images,points3D.txt
+    │       └── group_001/
+    └── SLAM/                                <-- SLAM keyframe submaps
+        └── episode_{name}/
             ├── scene_graph.json
             ├── colmap/
             ├── kf_debug/
@@ -67,6 +68,7 @@ from essn_vo import (
     kf_to_submap_map,
 )
 from kern_dual_edge import compute_dual_edges, print_dual_edge_summary
+from util_pipeline_report import generate_pipeline_summary_html
 from util_shared_intrinsics import load_shared_intrinsics
 from util_colmap import export_per_submap_colmap, export_slam_scene_graph
 from UTIL_IO_Discovery import discover_timestamps, discover_images
@@ -162,11 +164,25 @@ def _create_vo_output_dir(input_base: Path, output_base: Optional[str]) -> Path:
     return vo_dir
 
 
-def _create_episode_output(vo_output_dir: Path, episode_name: str) -> Path:
-    """Create per-episode output directory."""
-    episode_dir = vo_output_dir / episode_name
-    episode_dir.mkdir(parents=True, exist_ok=True)
-    return episode_dir
+def _create_episode_outputs(
+    vo_output_dir: Path, episode_name: str,
+) -> Tuple[Path, Path]:
+    """Create per-episode VO and SLAM output directories.
+
+    Layout::
+
+        vo_output_dir/
+          VO/episode_name/group_000/ ...
+          SLAM/episode_name/submap_000/ ...
+
+    Returns:
+        (vo_episode_dir, slam_episode_dir)
+    """
+    vo_ep = vo_output_dir / "VO" / episode_name
+    slam_ep = vo_output_dir / "SLAM" / episode_name
+    vo_ep.mkdir(parents=True, exist_ok=True)
+    slam_ep.mkdir(parents=True, exist_ok=True)
+    return vo_ep, slam_ep
 
 
 # ============================================================================
@@ -314,6 +330,165 @@ def _export_slam_outputs(
     logger.info("  Wrote %s", sg_path)
 
     return sg
+
+
+# ============================================================================
+# Debug-lite output (git-friendly alignment diagnostics)
+# ============================================================================
+
+def _extract_sim3_scale(T_s):
+    """Extract SIM3 scale from a 4x4 [sR,t;0,1] matrix."""
+    sR = T_s[:3, :3]
+    return float(np.cbrt(np.linalg.det(sR)))
+
+
+def _write_debug_lite(slam_ep_out, sp, slam_config_dict=None):
+    """Write lightweight alignment diagnostics for git upload.
+
+    Creates::
+
+        slam_ep_out/_debug_lite/
+        ├── config.json               # SLAM config snapshot
+        ├── stitch_records.json        # every alignment record (SIM3/SL4)
+        ├── submap_transforms.json     # per-submap T_s + extracted scale
+        ├── submap_summary.json        # per-submap image lists, frame IDs
+        ├── overlap_detection.json     # per-edge overlap frame pairs
+        └── graph_factors.json         # per-factor post-opt error
+
+    All files are small JSON — no binary data, no images.
+    """
+    import gtsam
+    from gtsam.symbol_shorthand import X
+
+    lite_dir = Path(slam_ep_out) / "_debug_lite"
+    lite_dir.mkdir(parents=True, exist_ok=True)
+
+    map_store = sp.map
+    graph = sp.graph
+
+    # ── 1. Config ──
+    if slam_config_dict:
+        with open(lite_dir / "config.json", "w") as f:
+            json.dump(slam_config_dict, f, indent=2)
+
+    # ── 2. Stitch records (raw from make_stitch_record) ──
+    with open(lite_dir / "stitch_records.json", "w") as f:
+        json.dump(sp.stitch_records, f, indent=2)
+
+    shadow = getattr(sp, "shadow_records", None)
+    if shadow:
+        with open(lite_dir / "shadow_stitch_records.json", "w") as f:
+            json.dump(shadow, f, indent=2)
+
+    # ── 3. Per-submap T_s transforms + scale ──
+    transforms = []
+    for submap in map_store.ordered_submaps_by_key():
+        sid = submap.get_id()
+        is_lc = submap.get_lc_status()
+        try:
+            T_s = graph.get_submap_transform(sid)
+            scale = _extract_sim3_scale(T_s)
+            T_list = T_s.tolist()
+        except Exception:
+            T_list = None
+            scale = None
+        transforms.append({
+            "submap_id": sid,
+            "is_lc": bool(is_lc),
+            "scale": scale,
+            "T_s": T_list,
+        })
+    with open(lite_dir / "submap_transforms.json", "w") as f:
+        json.dump(transforms, f, indent=2)
+
+    # ── 4. Per-submap summary ──
+    summaries = []
+    for submap in map_store.ordered_submaps_by_key():
+        sid = submap.get_id()
+        basenames = [os.path.basename(n) for n in submap.img_names]
+        fids = submap.get_frame_ids()
+        n_pts_raw = 0
+        n_pts_conf = 0
+        if submap.pointclouds is not None:
+            for idx in range(len(submap.pointclouds)):
+                n_raw = int(np.prod(submap.pointclouds[idx].shape[:-1]))
+                n_pts_raw += n_raw
+                if submap.conf_masks is not None:
+                    n_pts_conf += int(
+                        (submap.conf_masks[idx] > submap.conf_threshold).sum())
+        summaries.append({
+            "submap_id": sid,
+            "is_lc": bool(submap.get_lc_status()),
+            "num_images": len(basenames),
+            "image_basenames": basenames,
+            "frame_ids": [int(f) for f in fids] if fids is not None else [],
+            "conf_threshold": float(submap.conf_threshold)
+                if submap.conf_threshold is not None else None,
+            "points_raw": n_pts_raw,
+            "points_after_conf": n_pts_conf,
+        })
+    with open(lite_dir / "submap_summary.json", "w") as f:
+        json.dump(summaries, f, indent=2)
+
+    # ── 5. Overlap detection (re-derive from image names) ──
+    seq_submaps = [s for s in summaries if not s["is_lc"]]
+    overlap_info = []
+    for i in range(len(seq_submaps) - 1):
+        sa, sb = seq_submaps[i], seq_submaps[i + 1]
+        names_a = set(sa["image_basenames"])
+        shared = [n for n in sb["image_basenames"] if n in names_a]
+        overlap_info.append({
+            "submap_a": sa["submap_id"],
+            "submap_b": sb["submap_id"],
+            "num_images_a": sa["num_images"],
+            "num_images_b": sb["num_images"],
+            "shared_images": len(shared),
+            "shared_basenames": shared,
+        })
+    # LC submaps: list which sequential submaps their images come from
+    lc_submaps = [s for s in summaries if s["is_lc"]]
+    for lcs in lc_submaps:
+        connected = []
+        for name in lcs["image_basenames"]:
+            for ss in seq_submaps:
+                if name in ss["image_basenames"]:
+                    connected.append({
+                        "image": name,
+                        "seq_submap": ss["submap_id"],
+                    })
+                    break
+        overlap_info.append({
+            "lc_submap": lcs["submap_id"],
+            "num_images": lcs["num_images"],
+            "connections": connected,
+        })
+    with open(lite_dir / "overlap_detection.json", "w") as f:
+        json.dump(overlap_info, f, indent=2)
+
+    # ── 6. Graph factor errors (post-optimisation) ──
+    factors = []
+    try:
+        for i in range(graph.graph.size()):
+            factor = graph.graph.at(i)
+            keys = []
+            for k in factor.keys():
+                keys.append(int(gtsam.symbolIndex(k)))
+            try:
+                err = float(factor.error(graph.values))
+            except Exception:
+                err = None
+            factors.append({
+                "factor_idx": i,
+                "submap_keys": keys,
+                "error": err,
+            })
+    except Exception as e:
+        factors.append({"error": f"Could not iterate factors: {e}"})
+    with open(lite_dir / "graph_factors.json", "w") as f:
+        json.dump(factors, f, indent=2)
+
+    logger.info("  Wrote _debug_lite/ (%d files) -> %s", 6, lite_dir)
+    return lite_dir
 
 
 # ============================================================================
@@ -473,13 +648,15 @@ def run_pipeline(config_path: str) -> int:
             n_images = len(view_keys_or_paths)
             logger.info("SLAM: %d images (flat)", n_images)
 
-        # 5c. Create output directories
-        episode_out = _create_episode_output(vo_output_dir, episode_name)
-        slam_out = episode_out / "_slam"
+        # 5c. Create output directories (VO/ and SLAM/ side by side)
+        vo_ep_out, slam_ep_out = _create_episode_outputs(
+            vo_output_dir, episode_name)
+        logger.info("VO output:   %s", vo_ep_out)
+        logger.info("SLAM output: %s", slam_ep_out)
 
-        # 5d. Build SLAM config (outputs go into _slam/)
+        # 5d. Build SLAM config (outputs go into SLAM/episode/)
         slam_config = _build_slam_config(
-            vo_cfg, slam_out, shared_K, shared_K_hw)
+            vo_cfg, slam_ep_out, shared_K, shared_K_hw)
 
         # 5e. Run Pi3X SLAM (essn_slam)
         logger.info("Running Pi3X SLAM...")
@@ -491,11 +668,11 @@ def run_pipeline(config_path: str) -> int:
         else:
             slam.run(view_keys_or_paths)
 
-        # 5f. Export per-group COLMAP into episode_out/group_NNN/sparse/
+        # 5f. Export per-group COLMAP into VO/episode/group_NNN/sparse/
         logger.info("Exporting per-group COLMAP models...")
         sp = slam.submap_processor
         exported_groups = export_per_submap_colmap(
-            str(episode_out), sp.map, sp.graph, shared_K=shared_K)
+            str(vo_ep_out), sp.map, sp.graph, shared_K=shared_K)
         logger.info("Exported %d groups", len(exported_groups))
 
         # 5g. Collect all frame paths
@@ -506,11 +683,11 @@ def run_pipeline(config_path: str) -> int:
         else:
             all_paths = list(view_keys_or_paths)
 
-        # 5h. Export SLAM scene graph + keyframe submap staging into _slam/
+        # 5h. Export SLAM scene graph + keyframe submap staging into SLAM/episode/
         logger.info("Exporting SLAM scene graph + keyframe manifest...")
         use_symlinks = vo_cfg.get('output', {}).get('use_symlinks', True)
         sg = _export_slam_outputs(
-            slam_out, sp, all_paths, use_symlinks=use_symlinks)
+            slam_ep_out, sp, all_paths, use_symlinks=use_symlinks)
         logger.info("  Scene graph: %d submaps, %d edges, %d LCs",
                      sg["summary"]["num_submaps"],
                      sg["summary"]["num_kf_edges"],
@@ -539,14 +716,14 @@ def run_pipeline(config_path: str) -> int:
                         "(groups=%d, kfs=%d)",
                         len(exported_groups), len(kf_timeline))
 
-        # 5j. Stage per-group images from EPISODING (essn_vo, VO cameras only)
+        # 5j. Stage per-group images from EPISODING into VO/episode/ (VO cameras only)
         undistort_dir = image_root
         staging_info = {}
         if undistort_dir and undistort_dir.is_dir():
             logger.info("Staging group images (VO cameras: %s) from %s",
                         vo_cameras, undistort_dir)
             staging_info = stage_group_images(
-                episode_out, undistort_dir, exported_groups,
+                vo_ep_out, undistort_dir, exported_groups,
                 use_symlinks=use_symlinks,
                 vo_cameras=vo_cameras,
                 vo_camera_angles=vo_camera_angles,
@@ -554,15 +731,40 @@ def run_pipeline(config_path: str) -> int:
         else:
             logger.warning("Undistort dir not found; skipping image staging")
 
-        # 5k. Write grouping manifest with dual-edge data (essn_vo)
+        # 5k. Write grouping manifest with dual-edge data into VO/episode/
         write_grouping_manifest(
-            episode_out, exported_groups, staging_info,
+            vo_ep_out, exported_groups, staging_info,
             undistort_dir, all_paths,
             group_size, overlap, stride,
             kf_window=kf_window,
             kf_timeline=kf_timeline,
             registration_results=registration_results,
         )
+
+        # 5l. Collect keyframe agreement stats
+        kf_agreement = slam.keyframe_selector.get_agreement_stats()
+
+        # 5m. Read back manifest for the report
+        manifest_path = vo_ep_out / "grouping_manifest.json"
+        manifest_data = None
+        if manifest_path.is_file():
+            with open(manifest_path) as f:
+                manifest_data = json.load(f)
+
+        # 5n. Generate HTML summary at top level
+        logger.info("Generating pipeline_summary.html...")
+        html_path = generate_pipeline_summary_html(
+            output_dir=vo_output_dir,
+            scene_graph=sg,
+            exported_groups=exported_groups,
+            registration_results=registration_results,
+            manifest_data=manifest_data,
+            slam_report=None,
+            kf_agreement=kf_agreement,
+            elapsed_s=time.time() - t_start,
+            total_images=n_images,
+        )
+        logger.info("  HTML report: %s", html_path)
 
         episodes_processed.append({
             "name": episode_name,
@@ -592,6 +794,7 @@ def run_pipeline(config_path: str) -> int:
     logger.info("VO-en-SLAM pipeline complete in %.1fs", total_time)
     logger.info("  Episodes: %d", len(episodes_processed))
     logger.info("  Output: %s", vo_output_dir)
+    logger.info("  Report: %s", vo_output_dir / "pipeline_summary.html")
     logger.info("=" * 60)
 
     return 0

@@ -24,6 +24,22 @@ import numpy as np
 import open3d as o3d
 import torch
 
+
+def _write_ply(path: str, pts: np.ndarray, colors: np.ndarray,
+               max_pts: int = 500_000):
+    """Write a colored point cloud to PLY via Open3D."""
+    if len(pts) == 0:
+        return
+    if len(pts) > max_pts:
+        idx = np.random.choice(len(pts), max_pts, replace=False)
+        pts, colors = pts[idx], colors[idx]
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+    if colors.max() > 1.0:
+        colors = colors.astype(np.float64) / 255.0
+    pcd.colors = o3d.utility.Vector3dVector(colors[:, :3].astype(np.float64))
+    o3d.io.write_point_cloud(path, pcd, write_ascii=False)
+
 from termcolor import colored
 from util_colmap import write_colmap_txt
 
@@ -199,6 +215,8 @@ def save_stitch_debug(
         merged_pts = np.zeros((0, 3))
         merged_col = np.zeros((0, 3), dtype=np.uint8)
 
+    _write_ply(os.path.join(stitch_dir, "merged.ply"), merged_pts, merged_col)
+
     # --- COLMAP model for the pair ---
     colmap_dir = os.path.join(stitch_dir, "colmap")
     all_poses = []
@@ -211,11 +229,9 @@ def save_stitch_debug(
         all_names.extend(names_b)
     if all_poses:
         combined_poses = np.concatenate(all_poses, axis=0)
-        empty_pts = np.zeros((0, 3))
-        empty_col = np.zeros((0, 3), dtype=np.uint8)
         H, W = _frame_hw(prior_submap)
         write_colmap_txt(colmap_dir, combined_poses, all_names,
-                         empty_pts, empty_col, H, W)
+                         merged_pts, merged_col, H, W)
 
     n_a, n_b = len(pts_a), len(pts_b)
     print(f"  [StitchDebug] stitch_{seq:04d}/  "
@@ -259,13 +275,13 @@ def save_cumulative_debug(stitch_debug_dir: str, seq: int, map_store, graph):
     combined_pts = np.vstack(all_pts) if all_pts else np.zeros((0, 3))
     combined_col = np.vstack(all_colors) if all_colors else np.zeros((0, 3), dtype=np.uint8)
 
-    # COLMAP (cameras + images only, no points — keeps output small)
+    _write_ply(os.path.join(cum_dir, "cumulative.ply"), combined_pts, combined_col)
+
     if all_poses:
         combined_poses = np.concatenate(all_poses, axis=0)
         colmap_dir = os.path.join(cum_dir, "colmap")
-        empty_pts = np.zeros((0, 3))
-        empty_col = np.zeros((0, 3), dtype=np.uint8)
-        write_colmap_txt(colmap_dir, combined_poses, all_names, empty_pts, empty_col, H, W)
+        write_colmap_txt(colmap_dir, combined_poses, all_names,
+                         combined_pts, combined_col, H, W)
 
     print(f"  [StitchDebug] cumulative_{seq:04d}/  "
           f"colmap/ ({len(all_names)} cams, {len(all_pts)} submaps)", flush=True)
