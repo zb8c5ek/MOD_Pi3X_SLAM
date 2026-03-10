@@ -239,8 +239,13 @@ class SubmapProcessor:
                 pairs.append((prev_idx, curr_name_to_idx[prev_name]))
         return pairs
 
+    _MAX_ALIGN_PTS = 2000
+
     def _aggregate_overlap_points(self, current_submap, prior_submap, overlap_pairs):
         """Aggregate confidence-filtered point correspondences from overlap pairs.
+
+        Collects all points passing the dual-confidence gate, then keeps
+        the top ``_MAX_ALIGN_PTS`` by joint confidence (min of both views).
 
         Returns:
             (pts_curr, pts_prev) or (None, None) if insufficient points.
@@ -248,6 +253,7 @@ class SubmapProcessor:
         t0 = time.perf_counter()
         all_pts_curr = []
         all_pts_prev = []
+        all_conf = []
         total_raw = 0
         total_kept = 0
         for prev_idx, curr_idx in overlap_pairs:
@@ -262,18 +268,33 @@ class SubmapProcessor:
                     continue
             pts_c = current_submap.get_frame_pointcloud(curr_idx).reshape(-1, 3)[good_mask]
             pts_p = prior_submap.get_frame_pointcloud(prev_idx).reshape(-1, 3)[good_mask]
+            joint_conf = np.minimum(
+                current_conf.reshape(-1)[good_mask],
+                prior_conf.reshape(-1)[good_mask])
             total_kept += len(pts_c)
             all_pts_curr.append(pts_c)
             all_pts_prev.append(pts_p)
+            all_conf.append(joint_conf)
 
         if not all_pts_curr:
             return None, None
         t1 = time.perf_counter()
         result_curr = np.vstack(all_pts_curr)
         result_prev = np.vstack(all_pts_prev)
+        result_conf = np.concatenate(all_conf)
+
+        n_selected = len(result_curr)
+        if n_selected > self._MAX_ALIGN_PTS:
+            top_idx = np.argpartition(
+                result_conf, -self._MAX_ALIGN_PTS)[-self._MAX_ALIGN_PTS:]
+            result_curr = result_curr[top_idx]
+            result_prev = result_prev[top_idx]
+            n_selected = self._MAX_ALIGN_PTS
+
         t2 = time.perf_counter()
         print(f"    [AGGREGATE] {len(overlap_pairs)} frames, {total_raw} raw -> "
-              f"{total_kept} kept | loop={t1-t0:.3f}s vstack={t2-t1:.3f}s")
+              f"{total_kept} conf-pass -> {n_selected} top-K "
+              f"| loop={t1-t0:.3f}s select={t2-t1:.3f}s")
         return result_curr, result_prev
 
     def _add_edge(self, submap_id_curr, submap_id_prev=None,
@@ -317,7 +338,8 @@ class SubmapProcessor:
             n_overlap_frames = len(overlap_pairs)
             edge_label = 'LC' if is_loop_closure else f's{submap_id_prev}->s{submap_id_curr}'
             backend = self._stitch_backend
-            print(f"  [TIMING] aggregate_points: {t_agg:.3f}s ({n_pts} pts from {n_overlap_frames} frames)")
+            print(f"  [TIMING] aggregate_points: {t_agg:.3f}s "
+                  f"({n_pts} pts from {n_overlap_frames} frames)")
 
             # --- Primary alignment ---
             align_kwargs = dict(inlier_thresh=self.sim3_inlier_thresh)
