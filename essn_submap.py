@@ -2,7 +2,7 @@
 essn_submap - Submap processing, graph management, loop closure, and visualization.
 
 Owns the Pi3X model, the GTSAM pose graph, the SALAD image retrieval system,
-the Viser viewer, and the COLMAP exporter.  Processes one submap at a time
+the Rerun logger, and the COLMAP exporter.  Processes one submap at a time
 through the full reconstruction pipeline.
 
 Extracted from essn_slam.py so the orchestrator (essn_slam.Pi3xSLAM) stays thin.
@@ -19,7 +19,6 @@ import time
 
 import numpy as np
 import torch
-import open3d as o3d
 from termcolor import colored
 
 from kern_inference import (
@@ -35,7 +34,7 @@ from kern_loop_closure import ImageRetrieval
 from kern_stitch_debug import (
     save_stitch_debug, save_cumulative_debug, print_stitch_report,
 )
-from util_viewer import Viewer
+from util_rerun_logger import RerunLogger
 from util_colmap import export_all_colmap, export_poses as _export_poses
 from util_report import ESSNReport, setup_mod_logger
 from util_step_report import generate_step_report
@@ -69,8 +68,8 @@ class SubmapProcessor:
         lc_retrieval_threshold: float = 0.95,
         lc_conf_threshold: float = 0.25,
         vis_voxel_size: Optional[float] = None,
-        viewer_port: int = 8080,
-        viewer_max_points: Optional[int] = 10000,
+        rerun_save_path: Optional[str] = None,
+        rerun_max_points: Optional[int] = 10000,
         colmap_output_path: Optional[str] = None,
         log_poses_path: Optional[str] = None,
         stitch_debug_dir: Optional[str] = None,
@@ -93,7 +92,7 @@ class SubmapProcessor:
         self.colmap_output_path = colmap_output_path
         self.log_poses_path = log_poses_path
         self.stitch_debug_dir = stitch_debug_dir
-        self.viewer_max_points = viewer_max_points
+        self.rerun_max_points = rerun_max_points
         self.sim3_inlier_thresh = sim3_inlier_thresh
         self.alignment_mode = alignment_mode
         self.shadow_sl4 = shadow_sl4
@@ -116,7 +115,12 @@ class SubmapProcessor:
         print(f"Pi3X model loaded in {load_time:.2f}s")
 
         # SLAM components
-        self.viewer = Viewer(port=viewer_port) if viewer_port else None
+        self.rerun = None
+        if rerun_save_path is not None:
+            try:
+                self.rerun = RerunLogger(save_path=rerun_save_path)
+            except ImportError as e:
+                print(f"[Rerun] Disabled: {e}")
         self.map = GraphMap()
         self.graph = PoseGraph(mode=alignment_mode)
         self.image_retrieval = ImageRetrieval(device=device)
@@ -143,64 +147,41 @@ class SubmapProcessor:
     # Visualization helpers
     # ------------------------------------------------------------------
 
-    def _set_point_cloud(self, points, colors, name, point_size):
-        if not self.viewer:
-            return
-        if self.vis_voxel_size is not None:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-            pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
-            pcd = pcd.voxel_down_sample(self.vis_voxel_size)
-            points = np.asarray(pcd.points, dtype=np.float32)
-            colors = (np.asarray(pcd.colors) * 255).astype(np.uint8)
-        pcd_name = "pcd_" + name
-        handle = self.viewer.server.scene.add_point_cloud(
-            name=pcd_name, points=points, colors=colors,
-            point_size=point_size, point_shape="circle", precision="float32",
-        )
-        self.viewer.point_cloud_handles[pcd_name] = handle
-
     def _set_submap_point_cloud(self, submap):
-        if not self.viewer:
+        if not self.rerun:
             return
         try:
             points = submap.get_points_in_world_frame(self.graph)
             colors = submap.get_points_colors()
             if points is None or len(points) == 0:
-                print(f"[Viewer] WARNING: submap {submap.get_id()} has no points after filtering")
+                print(f"[Rerun] WARNING: submap {submap.get_id()} has no points after filtering")
                 return
             valid = np.isfinite(points).all(axis=1)
             if not valid.all():
                 points = points[valid]
                 colors = colors[valid]
-            n = len(points)
-            if self.viewer_max_points is None or self.viewer_max_points == 0:
-                max_pts = n
-            else:
-                max_pts = min(n, max(int(self.viewer.gui_max_points.value), self.viewer_max_points))
-            if n > max_pts:
-                idx = np.random.choice(n, max_pts, replace=False)
-                idx.sort()
-                points = points[idx]
-                colors = colors[idx]
-                print(f"[Viewer] Downsampled submap {submap.get_id()}: {n} -> {max_pts} points")
+            max_pts = self.rerun_max_points or 0
             name = str(submap.get_id())
-            print(f"[Viewer] Adding point cloud for submap {name}: {len(points)} points, range=[{points.min():.2f}, {points.max():.2f}]")
-            self._set_point_cloud(points, colors, name, 0.002)
+            print(f"[Rerun] Logging point cloud for submap {name}: {len(points)} pts")
+            self.rerun.log_point_cloud(
+                name, points, colors,
+                max_points=max_pts,
+                voxel_size=self.vis_voxel_size or 0.0,
+            )
         except Exception as e:
-            print(f"[Viewer] ERROR in point cloud for submap {submap.get_id()}: {e}")
+            print(f"[Rerun] ERROR in point cloud for submap {submap.get_id()}: {e}")
             import traceback; traceback.print_exc()
 
     def _set_submap_poses(self, submap):
-        if not self.viewer:
+        if not self.rerun:
             return
         try:
             extrinsics = submap.get_all_poses_world(self.graph)
             images = submap.get_all_frames()
-            print(f"[Viewer] Visualizing {extrinsics.shape[0]} camera poses for submap {submap.get_id()}")
-            self.viewer.visualize_frames(extrinsics, images, submap.get_id())
+            print(f"[Rerun] Logging {extrinsics.shape[0]} camera poses for submap {submap.get_id()}")
+            self.rerun.log_submap_poses(submap.get_id(), extrinsics, images)
         except Exception as e:
-            print(f"[Viewer] ERROR in poses for submap {submap.get_id()}: {e}")
+            print(f"[Rerun] ERROR in poses for submap {submap.get_id()}: {e}")
             import traceback; traceback.print_exc()
 
     def update_all_submap_vis(self):
@@ -689,7 +670,7 @@ class SubmapProcessor:
 
         # 9. Update visualization
         loop_detected = len(detected_loops) > 0
-        with prof("viewer_update"):
+        with prof("rerun_update"):
             if loop_detected:
                 self.update_all_submap_vis()
             else:

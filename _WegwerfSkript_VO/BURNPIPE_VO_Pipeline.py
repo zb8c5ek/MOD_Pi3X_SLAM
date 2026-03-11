@@ -26,11 +26,12 @@ Output layout::
     └── SLAM/                                <-- SLAM keyframe submaps
         └── episode_{name}/
             ├── scene_graph.json
+            ├── visualization_all.rrd
+            ├── KeyFrames/cam0/p+0_y+30_r+0/  <-- all unique KFs
             ├── colmap/
             ├── kf_debug/
             ├── stitch_debug/
-            └── submap_000/
-                └── <keyframe images>
+            └── submap_000/cam0/p+0_y+30_r+0/ <-- per-submap KFs
 """
 
 import sys
@@ -81,6 +82,7 @@ logging.basicConfig(
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp'}
 _FRAME_IDX_RE = re.compile(r"^(\d{6})_")
+_CAM_ANGLE_RE = re.compile(r"_(cam\d+)_(p[+-]\d+_y[+-]\d+_r[+-]\d+)\.\w+$")
 
 
 # ============================================================================
@@ -237,8 +239,8 @@ def _build_slam_config(
         lc_conf_threshold=slam.get('lc_conf_threshold', 0.25),
         sim3_inlier_thresh=slam.get('sim3_inlier_thresh', 0.5),
         kf_save_debug_images=slam.get('kf_save_debug_images', False),
-        viewer_port=slam.get('viewer_port', 0),
-        viewer_max_points=slam.get('viewer_max_points', 0),
+        rerun_save_path=slam.get('rerun_save_path', None),
+        rerun_max_points=slam.get('rerun_max_points', 0),
         output_dir=str(slam_output_dir),
         shared_intrinsics=shared_K,
         shared_intrinsics_hw=shared_K_hw,
@@ -254,6 +256,7 @@ def _export_slam_outputs(
     sp,
     all_frame_paths: list,
     use_symlinks: bool = True,
+    undistort_dir: Path = None,
 ) -> dict:
     """Export SLAM scene graph + keyframe images into ``_slam/``.
 
@@ -261,8 +264,10 @@ def _export_slam_outputs(
 
         slam_dir/
         ├── scene_graph.json
+        ├── KeyFrames/
+        │   └── cam{N}/angle/<all cams × all angles at KF timestamps>
         └── submap_NNN/
-            └── <keyframe images>
+            └── cam0/p+0_y+30_r+0/<keyframe images for this submap>
     """
     slam_dir.mkdir(parents=True, exist_ok=True)
 
@@ -275,7 +280,13 @@ def _export_slam_outputs(
             origin = Path(kf["origin_path"])
             if not origin.is_file():
                 continue
-            dst = sm_dir / kf["image_name"]
+            m = _CAM_ANGLE_RE.search(kf["image_name"])
+            if m:
+                cam, angle = m.group(1), m.group(2)
+                dst = sm_dir / cam / angle / kf["image_name"]
+            else:
+                dst = sm_dir / kf["image_name"]
+            dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.exists():
                 continue
             if use_symlinks:
@@ -289,6 +300,45 @@ def _export_slam_outputs(
     n_kf_images = sum(sm["num_keyframes"] for sm in sg["submaps"])
     logger.info("  Staged %d keyframe images across %d submaps",
                 n_kf_images, len(sg["submaps"]))
+
+    # Unified KeyFrames/ folder: collect ALL cameras × ALL angles for each
+    # keyframe timestamp from the undistort directory.
+    kf_dir = slam_dir / "KeyFrames"
+    kf_dir.mkdir(parents=True, exist_ok=True)
+    kf_frame_indices = set()
+    for sm in sg["submaps"]:
+        for kf in sm["keyframes"]:
+            if kf["frame_idx"] is not None:
+                kf_frame_indices.add(kf["frame_idx"])
+
+    n_kf_staged = 0
+    if undistort_dir and undistort_dir.is_dir() and kf_frame_indices:
+        kf_prefixes = {f"{fidx:06d}_" for fidx in kf_frame_indices}
+        for cam_dir in sorted(undistort_dir.iterdir()):
+            if not cam_dir.is_dir() or not cam_dir.name.startswith("cam"):
+                continue
+            for angle_dir in sorted(cam_dir.iterdir()):
+                if not angle_dir.is_dir():
+                    continue
+                for img_file in sorted(angle_dir.iterdir()):
+                    if img_file.suffix.lower() not in IMAGE_EXTS:
+                        continue
+                    if not any(img_file.name.startswith(p) for p in kf_prefixes):
+                        continue
+                    dst = kf_dir / cam_dir.name / angle_dir.name / img_file.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.exists():
+                        continue
+                    if use_symlinks:
+                        try:
+                            dst.symlink_to(img_file)
+                        except OSError:
+                            shutil.copy2(str(img_file), str(dst))
+                    else:
+                        shutil.copy2(str(img_file), str(dst))
+                    n_kf_staged += 1
+    logger.info("  KeyFrames/: %d images (%d timestamps × all cams/angles)",
+                n_kf_staged, len(kf_frame_indices))
 
     # Non-KF → KF association
     kf_frame_set = set()
@@ -714,7 +764,8 @@ def run_pipeline(config_path: str) -> int:
         logger.info("Exporting SLAM scene graph + keyframe manifest...")
         use_symlinks = vo_cfg.get('output', {}).get('use_symlinks', True)
         sg = _export_slam_outputs(
-            slam_ep_out, sp, all_paths, use_symlinks=use_symlinks)
+            slam_ep_out, sp, all_paths, use_symlinks=use_symlinks,
+            undistort_dir=image_root)
         logger.info("  Scene graph: %d submaps, %d edges, %d LCs",
                      sg["summary"]["num_submaps"],
                      sg["summary"]["num_kf_edges"],
@@ -797,6 +848,59 @@ def run_pipeline(config_path: str) -> int:
             total_images=n_images,
         )
         logger.info("  HTML report: %s", html_path)
+
+        # 5p. MASt3R remap (Tier 1: submaps, Tier 2: keyframes)
+        remap_cfg = vo_cfg.get('remap', {})
+        if remap_cfg.get('enabled', False):
+            from kern_remap import remap_submaps, remap_keyframes
+            _colmap_exe = remap_cfg.get('colmap_exe', 'colmap')
+            _remap_image_size = remap_cfg.get('image_size', 512)
+            _remap_min_matches = remap_cfg.get('min_num_matches', 15)
+            _remap_timeout = remap_cfg.get('mapper_timeout', 300)
+
+            # Load MASt3R model for remapping
+            logger.info("Loading MASt3R model for remapping...")
+            _mast3r_ckpt_dir = remap_cfg.get('mast3r_ckpt_dir', '')
+            _mast3r_model_name = remap_cfg.get(
+                'model_name',
+                'MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric')
+            _mast3r_dir = remap_cfg.get('mast3r_dir', '')
+            _dust3r_dir = remap_cfg.get('dust3r_dir', '')
+            for _p in (_mast3r_dir, _dust3r_dir):
+                if _p and _p not in sys.path:
+                    sys.path.insert(0, _p)
+            from mast3r.model import AsymmetricMASt3R
+            _ckpt = str(Path(_mast3r_ckpt_dir) / (_mast3r_model_name + '.pth'))
+            _remap_model = AsymmetricMASt3R.from_pretrained(_ckpt).eval().cuda()
+            logger.info("MASt3R model loaded for remap")
+
+            # Tier 1: submap remap
+            logger.info("Running Tier 1 remap (submaps)...")
+            t1_result = remap_submaps(
+                slam_dir=slam_ep_out,
+                model=_remap_model,
+                colmap_exe=_colmap_exe,
+                image_size=_remap_image_size,
+                min_num_matches=_remap_min_matches,
+                mapper_timeout=_remap_timeout,
+            )
+            logger.info("Tier 1 complete: %d submaps", t1_result["num_submaps"])
+
+            # Tier 2: keyframes remap
+            logger.info("Running Tier 2 remap (keyframes, all cams/angles)...")
+            t2_result = remap_keyframes(
+                slam_dir=slam_ep_out,
+                model=_remap_model,
+                colmap_exe=_colmap_exe,
+                image_size=_remap_image_size,
+                min_num_matches=_remap_min_matches,
+                mapper_timeout=remap_cfg.get('kf_mapper_timeout', 600),
+            )
+            logger.info("Tier 2 complete: %s", "ok" if t2_result.get("success") else "failed")
+
+            del _remap_model
+            import torch
+            torch.cuda.empty_cache()
 
         episodes_processed.append({
             "name": episode_name,

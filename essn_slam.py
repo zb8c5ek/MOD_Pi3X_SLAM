@@ -88,10 +88,10 @@ class SLAMConfig:
     shadow_sl4: bool = False         # run SL(4) as shadow comparison alongside primary
     sim3_inlier_thresh: float = 0.5  # RANSAC inlier threshold for alignment
 
-    # Visualization
+    # Visualization (Rerun)
     vis_voxel_size: Optional[float] = None
-    viewer_port: int = 0
-    viewer_max_points: Optional[int] = 10000  # 0 or None = no downsampling
+    rerun_save_path: Optional[str] = None     # None=off, ""=spawn live viewer, "path.rrd"=save
+    rerun_max_points: Optional[int] = 10000   # 0 or None = no downsampling
 
     # Debug
     stitch_debug_dir: Optional[str] = None  # save per-stitch PLY overlap + cumulative
@@ -176,8 +176,8 @@ class Pi3xSLAM:
             lc_retrieval_threshold=config.lc_retrieval_threshold,
             lc_conf_threshold=config.lc_conf_threshold,
             vis_voxel_size=config.vis_voxel_size,
-            viewer_port=config.viewer_port,
-            viewer_max_points=config.viewer_max_points,
+            rerun_save_path=config.rerun_save_path,
+            rerun_max_points=config.rerun_max_points,
             colmap_output_path=config.colmap_output_path,
             log_poses_path=config.log_poses_path,
             stitch_debug_dir=config.stitch_debug_dir,
@@ -216,6 +216,8 @@ class Pi3xSLAM:
                 path = os.path.join(run_root, subdir)
                 setattr(c, attr, path)
                 self.run_dirs[attr] = path
+            if c.rerun_save_path and not os.path.isabs(c.rerun_save_path):
+                c.rerun_save_path = os.path.join(run_root, c.rerun_save_path)
         else:
             attrs = ["stitch_debug_dir", "colmap_output_path", "log_poses_path"]
             if c.kf_save_debug_images:
@@ -583,16 +585,9 @@ class Pi3xSLAM:
         sp.export_poses()
 
     # ------------------------------------------------------------------
-    # Viewer keepalive
+    # Rerun info
     # ------------------------------------------------------------------
 
-    def wait_for_exit(self):
-        """Block until Ctrl+C, keeping the Viser viewer alive."""
-        port = self.config.viewer_port
-        print(f"\n=== Viser viewer ready at http://localhost:{port} ===")
-        print("Press Ctrl+C to exit.")
-        try:
-            while True:
-                time.sleep(1.0)
-        except KeyboardInterrupt:
-            print("Shutting down.")
+    def get_rerun_save_path(self) -> Optional[str]:
+        """Return the .rrd save path (if recording), else None."""
+        return self.config.rerun_save_path or None
