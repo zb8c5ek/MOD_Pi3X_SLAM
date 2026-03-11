@@ -50,6 +50,25 @@ for p in (str(_PROJECT_ROOT), str(_MODULE_ROOT), str(_SCRIPT_DIR)):
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
+def _derive_rig_from_strategy(strategy_cfg: Dict) -> Dict[str, List[str]]:
+    """Extract the union of all cam/angle combos from strategy config.
+
+    Scans ``stereo_pairs`` and ``slam_cameras`` in both regimes so that
+    every referenced cam/angle is staged.
+    """
+    rig: Dict[str, set] = {}
+    for regime in ("temporal_stitch", "lc_stitch"):
+        regime_cfg = strategy_cfg.get(regime, {})
+        for entry in regime_cfg.get("stereo_pairs", []):
+            for cam in entry.get("cameras", []):
+                for ang in entry.get(cam, []):
+                    rig.setdefault(cam, set()).add(ang)
+        for cam, angles in regime_cfg.get("slam_cameras", {}).items():
+            for ang in angles:
+                rig.setdefault(cam, set()).add(ang)
+    return {cam: sorted(angles) for cam, angles in rig.items()}
+
+
 # =============================================================================
 # Config loading
 # =============================================================================
@@ -221,14 +240,16 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("  Output    : %s", output_dir)
 
-    # ── Stage images ──
+    # ── Stage images (derived from strategy stereo_pairs + slam_cameras) ──
     logger.info("\n--- Step 1: Stage Images ---")
-    rigs = remap_cfg.get("rigs", [])
-    if not rigs:
-        logger.error("No rigs defined in global-remapping.rigs")
+    strategy_cfg = remap_cfg.get("strategy", {})
+    rig_angles = _derive_rig_from_strategy(strategy_cfg)
+    if not rig_angles:
+        logger.error("No cam/angle combos found in strategy.stereo_pairs")
         return 1
+    rigs = [{"name": "auto", **rig_angles}]
     staging_dir, filelist = collect_and_stage(kf_dir, rigs, output_dir)
-    logger.info("  %d images staged", len(filelist))
+    logger.info("  %d images staged from %s", len(filelist), rig_angles)
     if len(filelist) < 2:
         logger.error("Too few images (%d)", len(filelist))
         return 1
@@ -256,16 +277,8 @@ def main():
 
     # ── Generate pairs from SLAM scene graph (two-regime) ──
     logger.info("\n--- Step 3: Generate Pairs ---")
-    strategy_cfg = remap_cfg.get("strategy", {})
     temporal_stitch_cfg = strategy_cfg.get("temporal_stitch", {})
     lc_stitch_cfg = strategy_cfg.get("lc_stitch", {})
-
-    rig_angles: Dict[str, List[str]] = {}
-    for rig in rigs:
-        for key, val in rig.items():
-            if key == "name":
-                continue
-            rig_angles[key] = val if isinstance(val, list) else [val]
 
     from kern_global_remap_pairs import generate_pairs as generate_remap_pairs
     custom_pairs = generate_remap_pairs(
@@ -351,12 +364,14 @@ def main():
         logger.error("MASt3R matching failed: %s", db_result.get("error"))
         return 1
 
-    # ── COLMAP mapper ──
+    # ── COLMAP mapper (mapping_timeout: 0=unlimited, <0=skip) ──
     colmap_exe = remap_cfg.get("colmap_exe", "colmap")
-    mapper_timeout = remap_cfg.get("processing", {}).get("mapping_timeout", 600)
+    mapper_timeout = remap_cfg.get("processing", {}).get("mapping_timeout", 0)
 
-    if mapper_timeout and mapper_timeout > 0:
-        logger.info("\n--- Step 5: COLMAP Mapper ---")
+    if mapper_timeout is not None and mapper_timeout >= 0:
+        effective_timeout = mapper_timeout if mapper_timeout > 0 else None
+        logger.info("\n--- Step 5: COLMAP Mapper (timeout=%s) ---",
+                    f"{mapper_timeout}s" if mapper_timeout else "unlimited")
         from KernLib_M3RSfM.kern_colmap_mapper import run_mapper
 
         sparse_dir = output_dir / "sparse"
@@ -370,14 +385,14 @@ def main():
                 "multiple_models": mapper_cfg.get("multiple_models", False),
                 "extract_colors": mapper_cfg.get("extract_colors", True),
             },
-            timeout=mapper_timeout,
+            timeout=effective_timeout,
         )
         logger.info("  Mapper: success=%s, registered=%s, points3d=%s",
                     mapper_result.get("success"),
                     mapper_result.get("num_registered"),
                     mapper_result.get("num_points3d"))
     else:
-        logger.info("\n--- Step 5: COLMAP Mapper SKIPPED (mapping_timeout=0) ---")
+        logger.info("\n--- Step 5: COLMAP Mapper SKIPPED (mapping_timeout<0) ---")
         mapper_result = {"success": False, "num_registered": 0, "num_points3d": 0}
 
     # ── Report ──
