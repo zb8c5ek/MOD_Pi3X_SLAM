@@ -71,7 +71,12 @@ from essn_vo import (
 from kern_dual_edge import compute_dual_edges, print_dual_edge_summary
 from util_pipeline_report import generate_pipeline_summary_html
 from util_shared_intrinsics import load_shared_intrinsics
-from util_colmap import export_per_submap_colmap, export_slam_scene_graph
+from util_colmap import (
+    export_per_submap_colmap,
+    export_per_submap_colmap_slam,
+    export_all_colmap,
+    export_slam_scene_graph,
+)
 from UTIL_IO_Discovery import discover_timestamps, discover_images
 
 logger = logging.getLogger("BURNPIPE_VO_Pipeline")
@@ -747,6 +752,23 @@ def run_pipeline(config_path: str) -> int:
         exported_groups = export_per_submap_colmap(
             str(vo_ep_out), sp.map, sp.graph, shared_K=shared_K)
         logger.info("Exported %d groups", len(exported_groups))
+
+        # 5f-2. Export per-submap COLMAP into SLAM/episode/submap_NNN/sparse/
+        logger.info("Exporting per-submap COLMAP models (SLAM)...")
+        exported_submaps = export_per_submap_colmap_slam(
+            str(slam_ep_out), sp.map, sp.graph, shared_K=shared_K)
+        logger.info("Exported %d submaps", len(exported_submaps))
+
+        # 5f-3. Export unified COLMAP model (all cameras + all points + PLY)
+        logger.info("Exporting unified COLMAP model...")
+        unified_colmap_dir = slam_ep_out / "colmap"
+        unified_result = export_all_colmap(
+            str(unified_colmap_dir), sp.map, sp.graph, shared_K=shared_K)
+        if unified_result:
+            logger.info("Unified model: %d images, %d points -> %s",
+                        unified_result["num_images"],
+                        unified_result["num_points"],
+                        unified_result["path"])
 
         # 5g. Collect all frame paths
         all_paths = []

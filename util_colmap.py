@@ -120,6 +120,35 @@ def write_points3d_txt(output_path, points, colors=None):
             f.write(f"{i} {x} {y} {z} {int(r)} {int(g)} {int(b)} -1\n")
 
 
+def write_ply(output_path, points, colors=None, filename="points3D.ply"):
+    """Write a colored PLY point cloud.
+
+    Args:
+        output_path: Directory to write the PLY file.
+        points: (N, 3) XYZ coordinates.
+        colors: (N, 3) RGB in [0, 255]. Gray if None.
+        filename: PLY filename inside *output_path*.
+    """
+    n = len(points)
+    if n == 0:
+        return
+    filepath = os.path.join(output_path, filename)
+    with open(filepath, 'w') as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {n}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        f.write("end_header\n")
+        for i in range(n):
+            x, y, z = points[i]
+            if colors is not None:
+                r, g, b = int(colors[i][0]), int(colors[i][1]), int(colors[i][2])
+            else:
+                r, g, b = 128, 128, 128
+            f.write(f"{x} {y} {z} {r} {g} {b}\n")
+
+
 def write_colmap_txt(output_path, poses, image_names, points, colors, height, width,
                      focal_length=None, shared_K=None):
     """
@@ -146,18 +175,23 @@ def write_colmap_txt(output_path, poses, image_names, points, colors, height, wi
 # High-level pipeline exports
 # ---------------------------------------------------------------------------
 
-def export_all_colmap(colmap_output_path, map_store, graph, max_export_pts=500000):
-    """Export all submap poses and points to COLMAP text format.
+def export_all_colmap(colmap_output_path, map_store, graph, shared_K=None,
+                      max_export_pts=500000):
+    """Export unified COLMAP model with all cameras and points + PLY.
 
     Args:
         colmap_output_path: Directory to write COLMAP files. Skipped if None.
         map_store: GraphMap containing all submaps.
         graph: PoseGraph with optimised transforms.
+        shared_K: Optional (3, 3) real K matrix for cameras.txt.
         max_export_pts: Subsample points if total exceeds this.
+
+    Returns:
+        Dict with export summary, or None if skipped.
     """
     if not colmap_output_path:
-        return
-    print(f"Exporting COLMAP to {colmap_output_path}")
+        return None
+    print(f"Exporting unified COLMAP to {colmap_output_path}")
 
     all_poses = []
     all_names = []
@@ -178,11 +212,20 @@ def export_all_colmap(colmap_output_path, map_store, graph, max_export_pts=50000
 
     if not all_poses:
         print("No poses to export")
-        return
+        return None
 
     poses = np.concatenate(all_poses, axis=0)
-    points = np.zeros((0, 3))
-    colors = np.zeros((0, 3), dtype=np.uint8)
+
+    if all_points:
+        points = np.concatenate(all_points, axis=0)
+        colors = np.concatenate(all_colors, axis=0)
+        if len(points) > max_export_pts:
+            idx = np.random.choice(len(points), max_export_pts, replace=False)
+            points = points[idx]
+            colors = colors[idx]
+    else:
+        points = np.zeros((0, 3))
+        colors = np.zeros((0, 3), dtype=np.uint8)
 
     H = W = 0
     first_submap = next(map_store.ordered_submaps_by_key())
@@ -192,8 +235,20 @@ def export_all_colmap(colmap_output_path, map_store, graph, max_export_pts=50000
         else:
             H, W = first_submap.frames.shape[2], first_submap.frames.shape[3]
 
-    write_colmap_txt(colmap_output_path, poses, all_names, points, colors, H, W)
-    print(f"COLMAP export: {len(poses)} images (points skipped for size)")
+    write_colmap_txt(colmap_output_path, poses, all_names, points, colors,
+                     H, W, shared_K=shared_K)
+
+    if len(points) > 0:
+        write_ply(colmap_output_path, points, colors)
+
+    print(f"Unified COLMAP export: {len(poses)} images, {len(points)} points"
+          f" -> {colmap_output_path}")
+
+    return {
+        "num_images": len(poses),
+        "num_points": len(points),
+        "path": str(colmap_output_path),
+    }
 
 
 def export_per_submap_colmap(vo_results_dir, map_store, graph, shared_K=None,
@@ -258,6 +313,73 @@ def export_per_submap_colmap(vo_results_dir, map_store, graph, shared_K=None,
         print(f"  [VO Export] {group_name}: {len(poses_world)} images, "
               f"{len(points)} points -> {sparse_dir}")
         group_idx += 1
+
+    return exported
+
+
+def export_per_submap_colmap_slam(slam_dir, map_store, graph, shared_K=None,
+                                  max_export_pts=500000):
+    """Export each submap as a COLMAP model into the SLAM output directory.
+
+    Creates::
+
+        slam_dir/submap_NNN/sparse/0/{cameras,images,points3D}.txt
+
+    Args:
+        slam_dir: SLAM episode directory (e.g. SLAM/episode_name/).
+        map_store: GraphMap containing all submaps.
+        graph: PoseGraph with optimised transforms.
+        shared_K: Optional (3, 3) real K matrix for cameras.txt.
+        max_export_pts: Max points per submap before subsampling.
+
+    Returns:
+        List of (submap_idx, submap_dir, img_full_paths) tuples.
+    """
+    if not slam_dir:
+        return []
+
+    exported = []
+    submap_idx = 0
+
+    for submap in map_store.ordered_submaps_by_key():
+        if submap.get_lc_status():
+            continue
+
+        submap_name = f"submap_{submap_idx:03d}"
+        sparse_dir = os.path.join(slam_dir, submap_name, "sparse", "0")
+        os.makedirs(sparse_dir, exist_ok=True)
+
+        poses_world = submap.get_all_poses_world(graph)
+        img_full_paths = list(submap.img_names)
+        img_names = [os.path.basename(n) for n in img_full_paths]
+
+        points = submap.get_points_in_world_frame(graph)
+        colors = submap.get_points_colors()
+        if points is None:
+            points = np.zeros((0, 3))
+            colors = np.zeros((0, 3), dtype=np.uint8)
+        elif len(points) > max_export_pts:
+            idx = np.random.choice(len(points), max_export_pts, replace=False)
+            points = points[idx]
+            colors = colors[idx]
+
+        H = W = 0
+        if submap.frames is not None:
+            if isinstance(submap.frames, torch.Tensor):
+                _, _, H, W = submap.frames.shape
+            else:
+                H, W = submap.frames.shape[2], submap.frames.shape[3]
+
+        write_colmap_txt(sparse_dir, poses_world, img_names, points, colors,
+                         H, W, shared_K=shared_K)
+        if len(points) > 0:
+            write_ply(sparse_dir, points, colors)
+
+        exported.append((submap_idx, os.path.join(slam_dir, submap_name),
+                         img_full_paths))
+        print(f"  [SLAM Export] {submap_name}: {len(poses_world)} images, "
+              f"{len(points)} points -> {sparse_dir}")
+        submap_idx += 1
 
     return exported
 
