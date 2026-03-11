@@ -343,7 +343,7 @@ def main():
 
     # ── Report ──
     logger.info("\n--- Step 6: Generate Report ---")
-    from kern_global_remap_report import generate_report
+    from UTILREPORT_global_remap import generate_report
 
     pairs_txt = db_output / "pairs.txt"
     report_html = output_dir / "global_remap_report.html"
