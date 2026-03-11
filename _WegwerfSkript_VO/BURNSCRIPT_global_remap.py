@@ -204,6 +204,8 @@ def main():
         description="Global MASt3R remap on SLAM KeyFrames",
     )
     parser.add_argument("config", type=str, help="Path to LORD config YAML")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Run identity stamp (shared with LORDPIPE)")
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -216,6 +218,8 @@ def main():
     if not remap_cfg:
         logger.error("No 'global-remapping' section in config")
         return 1
+
+    run_id = args.run_id or cfg.get("global", {}).get("run_id")
 
     t0 = time.time()
 
@@ -230,13 +234,14 @@ def main():
     logger.info("  Episode   : %s", paths["episode_name"])
     logger.info("  KeyFrames : %s", kf_dir)
     logger.info("  SceneGraph: %s", sg_json)
+    if run_id:
+        logger.info("  RunID     : %s", run_id)
 
     # ── Output dir ──
-    processing_dir = Path(cfg["global"]["processing_dir"])
-    # Find the run dir (same as the one containing VO output)
     vo_folder = Path(cfg["overrides"]["vo_episoding_folder"])
     run_dir = vo_folder.parent
-    output_dir = run_dir / f"GlobalRemap_{ep_dir.name}"
+    suffix = f"_{run_id}" if run_id else ""
+    output_dir = run_dir / f"GlobalRemap_{ep_dir.name}{suffix}"
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("  Output    : %s", output_dir)
 
