@@ -1,5 +1,5 @@
 """
-UTIL4Burn_LoadYaml - YAML config loader for Pi3X SLAM pipeline.
+IO_UTIL_LoadYaml - YAML config loader for Pi3X SLAM pipeline.
 
 Loads a YAML config file and flattens it into a dict compatible
 with essn_slam.SLAMConfig.

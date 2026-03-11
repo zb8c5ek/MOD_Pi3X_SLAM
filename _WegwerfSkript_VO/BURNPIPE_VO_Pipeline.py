@@ -77,7 +77,7 @@ from util_colmap import (
     export_all_colmap,
     export_slam_scene_graph,
 )
-from UTIL_IO_Discovery import discover_timestamps, discover_images
+from IO_UTIL_Discovery import discover_timestamps, discover_images
 
 logger = logging.getLogger("BURNPIPE_VO_Pipeline")
 logging.basicConfig(
@@ -117,7 +117,7 @@ def _parse_cameras(input_cfg: dict) -> Tuple[List[str], Dict[str, List[str]]]:
 
 
 # ============================================================================
-# Image discovery (wraps UTIL_IO_Discovery)
+# Image discovery (wraps IO_UTIL_Discovery)
 # ============================================================================
 
 def _discover_episode_images(

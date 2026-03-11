@@ -596,3 +596,124 @@ class Pi3xSLAM:
     def get_rerun_save_path(self) -> Optional[str]:
         """Return the .rrd save path (if recording), else None."""
         return self.config.rerun_save_path or None
+
+
+# ======================================================================
+# CLI entry point  (LORD -> ESSN subprocess invocation)
+# ======================================================================
+
+def main() -> int:
+    """Run Pi3X SLAM from a YAML config file.
+
+    Usage::
+
+        python essn_slam.py <config.yaml>
+        python essn_slam.py --help
+
+    The YAML is loaded via ``IO_UTIL_LoadYaml.load_slam_config`` which
+    flattens the nested structure into a flat dict for ``SLAMConfig``.
+
+    Returns:
+        0 on success, 1 on failure.
+    """
+    import argparse
+    import logging
+    import sys
+
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _wegwerf_dir = os.path.join(_script_dir, "_WegwerfSkript_VO")
+    for p in (_script_dir, _wegwerf_dir):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+    from IO_UTIL_Discovery import discover_timestamps, discover_images
+    from IO_UTIL_LoadYaml import load_slam_config
+
+    parser = argparse.ArgumentParser(description="Pi3X Visual SLAM (ESSN entry point)")
+    parser.add_argument("config", type=str, help="Path to SLAM config YAML")
+    args = parser.parse_args()
+
+    config_path = args.config
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(os.getcwd(), config_path)
+
+    if not os.path.isfile(config_path):
+        print(f"Config not found: {config_path}", file=sys.stderr)
+        return 1
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+    logger = logging.getLogger("essn_slam")
+    logger.info("Loading config from %s", config_path)
+
+    try:
+        cfg = load_slam_config(config_path)
+
+        # Discover images
+        cameras = cfg.get('cameras', ['cam0'])
+        camera_angles = cfg.get('camera_angles', {})
+        stride = cfg.get('stride_frame', 1)
+
+        try:
+            timestamps, view_keys = discover_timestamps(
+                data_root=cfg['data_root'],
+                cameras=cameras,
+                camera_angles=camera_angles,
+                stride=stride,
+            )
+            multi_view = True
+        except ValueError:
+            image_paths = discover_images(
+                data_root=cfg['data_root'],
+                cameras=cameras,
+                camera_angles=camera_angles,
+                stride=stride,
+            )
+            multi_view = False
+            view_keys = []
+
+        # Build SLAMConfig
+        slam_config = SLAMConfig(
+            ckpt_path=cfg['ckpt_path'],
+            device=cfg.get('device', 'cuda'),
+            dtype=cfg.get('dtype', 'float16'),
+            pixel_limit=cfg.get('pixel_limit', 255000),
+            submap_size=cfg.get('submap_size', 16),
+            overlap_window=cfg.get('overlap_window', 1),
+            max_submaps=cfg.get('max_submaps', 0),
+            conf_threshold=cfg.get('conf_threshold', 50.0),
+            conf_min_abs=cfg.get('conf_min_abs', 0.0),
+            keyframe_method=cfg.get('keyframe_method', 'waft'),
+            waft_ckpt_path=cfg.get('waft_ckpt_path'),
+            min_disparity=cfg.get('min_disparity', 50.0),
+            use_keyframe_selection=cfg.get('use_keyframe_selection', True),
+            shadow_keyframe_method=cfg.get('shadow_keyframe_method', 'lk'),
+            max_loops=cfg.get('max_loops', 1),
+            lc_retrieval_threshold=cfg.get('lc_retrieval_threshold', 0.95),
+            lc_conf_threshold=cfg.get('lc_conf_threshold', 0.25),
+            sim3_inlier_thresh=cfg.get('sim3_inlier_thresh', 0.5),
+            kf_save_debug_images=cfg.get('kf_save_debug_images', False),
+            output_dir=cfg.get('output_dir'),
+            config_yaml_path=config_path,
+        )
+
+        # Run SLAM
+        slam = Pi3xSLAM(slam_config, view_keys=view_keys)
+        if multi_view:
+            slam.run_timestamps(timestamps)
+        else:
+            slam.run(image_paths)
+
+        logger.info("SLAM complete.")
+        return 0
+
+    except Exception:
+        logger.exception("SLAM failed")
+        return 1
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _sys.exit(main())

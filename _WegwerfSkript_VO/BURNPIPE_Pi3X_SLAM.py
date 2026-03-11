@@ -17,8 +17,8 @@ _module_root = os.path.dirname(_script_dir)
 if _module_root not in sys.path:
     sys.path.insert(0, _module_root)
 
-from UTIL4Burn_LoadYaml import load_slam_config
-from UTIL_IO_Discovery import discover_timestamps, discover_images
+from IO_UTIL_LoadYaml import load_slam_config
+from IO_UTIL_Discovery import discover_timestamps, discover_images
 from essn_slam import SLAMConfig, Pi3xSLAM
 
 
@@ -74,13 +74,12 @@ def main():
         lc_retrieval_threshold=cfg['lc_retrieval_threshold'],
         lc_conf_threshold=cfg['lc_conf_threshold'],
         sim3_inlier_thresh=cfg.get('sim3_inlier_thresh', 0.5),
-        kf_debug_dir=cfg.get('kf_debug_dir'),
+        kf_save_debug_images=bool(cfg.get('kf_debug_dir')),
         stitch_debug_dir=cfg.get('stitch_debug_dir'),
         colmap_output_path=cfg.get('colmap_output_path'),
         log_poses_path=cfg.get('log_poses_path'),
         output_dir=cfg.get('output_dir'),
-        viewer_port=cfg.get('viewer_port', 8080),
-        viewer_max_points=cfg.get('viewer_max_points', 10000),
+        rerun_max_points=cfg.get('viewer_max_points', 10000),
         config_yaml_path=config_path,
     )
 
@@ -90,7 +89,6 @@ def main():
         slam.run_timestamps(timestamps)
     else:
         slam.run(image_paths)
-    slam.wait_for_exit()
 
 
 if __name__ == "__main__":

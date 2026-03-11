@@ -1,5 +1,5 @@
 """
-UTIL_IO_Discovery - Image discovery and loading for the Pi3X SLAM pipeline.
+IO_UTIL_Discovery - Image discovery and loading for the Pi3X SLAM pipeline.
 
 Supports three data layouts:
 
