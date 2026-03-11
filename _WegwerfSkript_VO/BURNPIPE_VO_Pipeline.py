@@ -310,6 +310,19 @@ def _export_slam_outputs(
     logger.info("  Staged %d keyframe images across %d submaps",
                 n_kf_images, len(sg["submaps"]))
 
+    # Rename LC submap directories with _lc suffix for clarity
+    for lc_sid in sg.get("lc_submap_ids", []):
+        lc_dir = slam_dir / f"submap_{lc_sid:03d}"
+        lc_dir_renamed = slam_dir / f"submap_{lc_sid:03d}_lc"
+        if lc_dir.is_dir() and not lc_dir_renamed.exists():
+            lc_dir.rename(lc_dir_renamed)
+    n_lc_renamed = sum(
+        1 for lc_sid in sg.get("lc_submap_ids", [])
+        if (slam_dir / f"submap_{lc_sid:03d}_lc").is_dir()
+    )
+    if n_lc_renamed:
+        logger.info("  Renamed %d LC submap dirs with _lc suffix", n_lc_renamed)
+
     # Unified KeyFrames/ folder: collect ALL cam/angle images at keyframe
     # timestamps from the undistort dir (not just SLAM cameras).
     kf_dir = slam_dir / "KeyFrames"

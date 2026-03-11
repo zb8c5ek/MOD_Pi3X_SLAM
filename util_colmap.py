@@ -565,13 +565,17 @@ def export_slam_scene_graph(map_store, graph, stitch_records=None):
                 "backend": rec.get("backend"),
             })
 
+    lc_submap_ids = [s.get_id() for s in lc_submaps]
+
     return {
         "submaps": submaps_out,
         "kf_edges": kf_edges,
         "loop_closures": lc_edges,
+        "lc_submap_ids": lc_submap_ids,
         "registration": registration,
         "summary": {
             "num_submaps": len(submaps_out),
+            "num_lc_submaps": len(lc_submap_ids),
             "num_kf_edges": len(kf_edges),
             "num_loop_closures": len(lc_edges),
             "num_submaps_total": map_store.get_num_submaps(),

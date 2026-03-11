@@ -266,6 +266,7 @@ def main():
             filelist_relpath=filelist,
             window_size=strategy_cfg.get("window_size", 1),
             include_lc=strategy_cfg.get("included_lc", True),
+            temporal_window=strategy_cfg.get("temporal_window", 1),
         )
     else:
         logger.warning("Unknown strategy '%s', using all-pairs", strategy_name)
@@ -302,11 +303,45 @@ def main():
         pixel_tol=match_cfg.get("pixel_tol", 5),
     )
 
-    release_model(model)
-
-    logger.info("  DB result: success=%s, pairs=%s, time=%.1fs",
+    logger.info("  [KernLib] DB result: success=%s, pairs=%s, time=%.1fs",
                 db_result.get("success"), db_result.get("num_pairs"),
                 db_result.get("processing_time", 0))
+
+    # ── Step 4b: MOD_Mapper3r A/B comparison ──
+    logger.info("\n--- Step 4b: MOD_Mapper3r (A/B comparison) ---")
+    mapper3r_result = {"success": False, "num_pairs": 0, "processing_time": 0}
+    try:
+        mapper3r_root = _PROJECT_ROOT / "_Deprecated" / "MOD_Mapper3r-master"
+        mapper3r_fp = str(mapper3r_root / "feature_process")
+        if mapper3r_fp not in sys.path:
+            sys.path.insert(0, mapper3r_fp)
+        if str(mapper3r_root) not in sys.path:
+            sys.path.insert(0, str(mapper3r_root))
+
+        from essn_create_db import (
+            create_db_from_folder_with_structure as mapper3r_create_db,
+        )
+
+        mapper3r_output = output_dir / "mapper3r_db"
+        mapper3r_result = mapper3r_create_db(
+            root_path=staging_dir,
+            filelist_relpath=filelist,
+            dp_output=mapper3r_output,
+            model=model,
+            matching_strategy=matching_strategy,
+            image_size=img_cfg.get("size", 512),
+            camera_model=mapper_cfg.get("camera_model", "PINHOLE"),
+            share_intrinsics_by_subfolder=mapper_cfg.get("share_intrinsics_by_subfolder", True),
+            batch_size=inf_cfg.get("batch_size", 16),
+            custom_pairs=custom_pairs,
+        )
+        logger.info("  [Mapper3r] DB result: success=%s, pairs=%s, time=%.1fs",
+                    mapper3r_result.get("success"), mapper3r_result.get("num_pairs"),
+                    mapper3r_result.get("processing_time", 0))
+    except Exception as e:
+        logger.warning("  [Mapper3r] A/B comparison failed (non-fatal): %s", e, exc_info=True)
+
+    release_model(model)
 
     if not db_result.get("success"):
         logger.error("MASt3R matching failed: %s", db_result.get("error"))
@@ -367,10 +402,15 @@ def main():
         "strategy": strategy_cfg,
         "rigs": rigs,
         "num_images": len(filelist),
-        "matching": {
+        "matching_kernlib": {
             "strategy": str(matching_strategy),
             "num_pairs": db_result.get("num_pairs", 0),
             "matching_time": db_result.get("processing_time", 0),
+        },
+        "matching_mapper3r": {
+            "num_pairs": mapper3r_result.get("num_pairs", 0),
+            "matching_time": mapper3r_result.get("processing_time", 0),
+            "success": mapper3r_result.get("success", False),
         },
         "mapper": {
             "success": mapper_result.get("success", False),
@@ -389,17 +429,23 @@ def main():
     logger.info("\n" + "=" * 60)
     logger.info("GLOBAL REMAP COMPLETE")
     logger.info("=" * 60)
-    logger.info("  Images:      %d", len(filelist))
-    logger.info("  Pairs:       %d", db_result.get("num_pairs", 0))
-    logger.info("  Registered:  %d / %d",
+    logger.info("  Images:         %d", len(filelist))
+    logger.info("  Input pairs:    %d", n_pairs)
+    logger.info("  ── KernLib  ──  verified=%s  time=%.1fs",
+                db_result.get("num_pairs", 0),
+                db_result.get("processing_time", 0))
+    logger.info("  ── Mapper3r ──  verified=%s  time=%.1fs",
+                mapper3r_result.get("num_pairs", 0),
+                mapper3r_result.get("processing_time", 0))
+    logger.info("  Registered:     %d / %d",
                 mapper_result.get("num_registered", 0), len(filelist))
-    logger.info("  3D Points:   %d", mapper_result.get("num_points3d", 0))
-    logger.info("  Time:        %.1fs", elapsed)
-    logger.info("  Output:      %s", output_dir)
+    logger.info("  3D Points:      %d", mapper_result.get("num_points3d", 0))
+    logger.info("  Total time:     %.1fs", elapsed)
+    logger.info("  Output:         %s", output_dir)
     if mapper_result.get("recon_dir"):
-        logger.info("  Recon:       %s", mapper_result["recon_dir"])
+        logger.info("  Recon:          %s", mapper_result["recon_dir"])
     if report_html:
-        logger.info("  Report:      %s", report_html)
+        logger.info("  Report:         %s", report_html)
     logger.info("=" * 60)
 
     return 0
