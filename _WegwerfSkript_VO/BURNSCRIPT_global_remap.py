@@ -196,6 +196,90 @@ def collect_and_stage(
 
 
 # =============================================================================
+# Model enumeration & COLMAP project assembly
+# =============================================================================
+
+def _enumerate_models(sparse_dir: Path) -> List[Dict[str, Any]]:
+    """Enumerate all COLMAP sub-models in *sparse_dir* and return stats.
+
+    Each entry: ``{name, path, num_registered, num_points3d}``.
+    Returns an empty list if no models are found.
+    """
+    if not sparse_dir.is_dir():
+        return []
+    try:
+        import pycolmap
+    except ImportError:
+        logger.warning("pycolmap not installed — cannot enumerate models")
+        return []
+
+    models = []
+    for d in sorted(sparse_dir.iterdir()):
+        if not d.is_dir() or not (d / "images.bin").exists():
+            continue
+        try:
+            recon = pycolmap.Reconstruction(str(d))
+            models.append({
+                "name": d.name,
+                "path": d,
+                "num_registered": recon.num_reg_images(),
+                "num_points3d": recon.num_points3D(),
+            })
+        except Exception as exc:
+            logger.warning("  Could not load model %s: %s", d.name, exc)
+    return models
+
+
+def _assemble_colmap_project(
+    output_dir: Path,
+    db_path: Path,
+    best_model_dir: Path,
+    staging_dir: Path,
+) -> Path:
+    """Build a self-contained COLMAP project folder.
+
+    Layout::
+
+        output_dir/colmap_project/
+            database.db          ← copy of the MASt3R DB
+            images/              ← copy (or symlink) of staged images
+            sparse/0/            ← the selected best model
+                cameras.bin
+                images.bin
+                points3D.bin
+    """
+    proj = output_dir / "colmap_project"
+    proj.mkdir(parents=True, exist_ok=True)
+
+    # Database
+    dst_db = proj / "database.db"
+    if not dst_db.exists():
+        shutil.copy2(str(db_path), str(dst_db))
+        logger.info("    database.db  <- %s", db_path.name)
+
+    # Best model -> sparse/0/
+    dst_sparse = proj / "sparse" / "0"
+    dst_sparse.mkdir(parents=True, exist_ok=True)
+    for f in best_model_dir.iterdir():
+        if f.is_file():
+            shutil.copy2(str(f), str(dst_sparse / f.name))
+    logger.info("    sparse/0/    <- %s", best_model_dir)
+
+    # Images — use a directory junction on Windows, symlink on Linux,
+    # fall back to copying if symlinks fail.
+    dst_images = proj / "images"
+    if not dst_images.exists():
+        try:
+            dst_images.symlink_to(staging_dir, target_is_directory=True)
+            logger.info("    images/      -> %s (symlink)", staging_dir)
+        except OSError:
+            shutil.copytree(str(staging_dir), str(dst_images))
+            logger.info("    images/      <- %s (copy)", staging_dir)
+
+    return proj
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -373,13 +457,15 @@ def main():
     colmap_exe = remap_cfg.get("colmap_exe", "colmap")
     mapper_timeout = remap_cfg.get("processing", {}).get("mapping_timeout", 0)
 
+    sparse_dir = output_dir / "sparse"
+    mapper_result = {"success": False, "num_registered": 0, "num_points3d": 0}
+
     if mapper_timeout is not None and mapper_timeout >= 0:
         effective_timeout = mapper_timeout if mapper_timeout > 0 else None
         logger.info("\n--- Step 5: COLMAP Mapper (timeout=%s) ---",
                     f"{mapper_timeout}s" if mapper_timeout else "unlimited")
         from KernLib_M3RSfM.kern_colmap_mapper import run_mapper
 
-        sparse_dir = output_dir / "sparse"
         mapper_result = run_mapper(
             colmap_exe=colmap_exe,
             db_path=db_result["database_path"],
@@ -387,7 +473,7 @@ def main():
             output_path=str(sparse_dir),
             mapper_options={
                 "min_num_matches": mapper_cfg.get("min_num_matches", 150),
-                "multiple_models": mapper_cfg.get("multiple_models", False),
+                "multiple_models": mapper_cfg.get("multiple_models", True),
                 "extract_colors": mapper_cfg.get("extract_colors", True),
             },
             timeout=effective_timeout,
@@ -398,7 +484,46 @@ def main():
                     mapper_result.get("num_points3d"))
     else:
         logger.info("\n--- Step 5: COLMAP Mapper SKIPPED (mapping_timeout<0) ---")
-        mapper_result = {"success": False, "num_registered": 0, "num_points3d": 0}
+
+    # ── Step 5b: Multi-model report & best-model selection ──
+    all_models = _enumerate_models(sparse_dir)
+    best_model_dir = None
+
+    if all_models:
+        logger.info("\n--- Step 5b: Model Report & Selection ---")
+        logger.info("  Found %d model(s) in %s", len(all_models), sparse_dir)
+        logger.info("  %-10s  %10s  %10s  %8s", "Model", "Registered", "3D Points", "% of N")
+        logger.info("  " + "-" * 46)
+        for m in all_models:
+            pct = 100.0 * m["num_registered"] / len(filelist) if filelist else 0
+            logger.info("  %-10s  %10d  %10d  %7.1f%%",
+                        m["name"], m["num_registered"], m["num_points3d"], pct)
+
+        best = max(all_models, key=lambda m: m["num_registered"])
+        best_model_dir = best["path"]
+        logger.info("  >> Selected: %s (%d registered, %d 3D points)",
+                    best["name"], best["num_registered"], best["num_points3d"])
+        mapper_result["num_registered"] = best["num_registered"]
+        mapper_result["num_points3d"] = best["num_points3d"]
+        mapper_result["recon_dir"] = str(best_model_dir)
+        mapper_result["success"] = True
+        mapper_result["all_models"] = [
+            {"name": m["name"], "num_registered": m["num_registered"],
+             "num_points3d": m["num_points3d"]}
+            for m in all_models
+        ]
+
+    # ── Step 5c: Assemble proper COLMAP project folder ──
+    colmap_project_dir = None
+    if best_model_dir is not None:
+        logger.info("\n--- Step 5c: Assemble COLMAP Project ---")
+        colmap_project_dir = _assemble_colmap_project(
+            output_dir=output_dir,
+            db_path=Path(db_result["database_path"]),
+            best_model_dir=best_model_dir,
+            staging_dir=staging_dir,
+        )
+        logger.info("  COLMAP project: %s", colmap_project_dir)
 
     # ── Report ──
     logger.info("\n--- Step 6: Generate Report ---")
@@ -441,7 +566,9 @@ def main():
             "num_registered": mapper_result.get("num_registered", 0),
             "num_points3d": mapper_result.get("num_points3d", 0),
             "recon_dir": mapper_result.get("recon_dir"),
+            "all_models": mapper_result.get("all_models", []),
         },
+        "colmap_project": str(colmap_project_dir) if colmap_project_dir else None,
         "total_time": round(elapsed, 1),
         "report_html": str(report_html) if report_html else None,
     }
@@ -461,13 +588,16 @@ def main():
     logger.info("  ── Mapper3r ──  verified=%s  time=%.1fs",
                 mapper3r_result.get("num_pairs", 0),
                 mapper3r_result.get("processing_time", 0))
+    logger.info("  Models:         %d", len(all_models))
     logger.info("  Registered:     %d / %d",
                 mapper_result.get("num_registered", 0), len(filelist))
     logger.info("  3D Points:      %d", mapper_result.get("num_points3d", 0))
     logger.info("  Total time:     %.1fs", elapsed)
     logger.info("  Output:         %s", output_dir)
+    if colmap_project_dir:
+        logger.info("  COLMAP Project: %s", colmap_project_dir)
     if mapper_result.get("recon_dir"):
-        logger.info("  Recon:          %s", mapper_result["recon_dir"])
+        logger.info("  Best model:     %s", mapper_result["recon_dir"])
     if report_html:
         logger.info("  Report:         %s", report_html)
     logger.info("=" * 60)
