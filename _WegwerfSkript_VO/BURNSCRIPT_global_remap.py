@@ -254,23 +254,27 @@ def main():
     matching_strategy = parse_matching_strategy(match_raw)
     logger.info("  Model loaded, strategy=%s", matching_strategy)
 
-    # ── Generate pairs from SLAM scene graph ──
+    # ── Generate pairs from SLAM scene graph (two-regime) ──
     logger.info("\n--- Step 3: Generate Pairs ---")
     strategy_cfg = remap_cfg.get("strategy", {})
-    strategy_name = strategy_cfg.get("name", "submap-window")
+    temporal_stitch_cfg = strategy_cfg.get("temporal_stitch", {})
+    lc_stitch_cfg = strategy_cfg.get("lc_stitch", {})
 
-    if strategy_name == "submap-window":
-        from kern_global_remap_pairs import generate_submap_window_pairs
-        custom_pairs = generate_submap_window_pairs(
-            scene_graph_json=str(sg_json),
-            filelist_relpath=filelist,
-            window_size=strategy_cfg.get("window_size", 1),
-            include_lc=strategy_cfg.get("included_lc", True),
-            temporal_window=strategy_cfg.get("temporal_window", 1),
-        )
-    else:
-        logger.warning("Unknown strategy '%s', using all-pairs", strategy_name)
-        custom_pairs = None
+    rig_angles: Dict[str, List[str]] = {}
+    for rig in rigs:
+        for key, val in rig.items():
+            if key == "name":
+                continue
+            rig_angles[key] = val if isinstance(val, list) else [val]
+
+    from kern_global_remap_pairs import generate_pairs as generate_remap_pairs
+    custom_pairs = generate_remap_pairs(
+        scene_graph_json=str(sg_json),
+        filelist_relpath=filelist,
+        temporal_stitch_cfg=temporal_stitch_cfg,
+        lc_stitch_cfg=lc_stitch_cfg,
+        rig_angles=rig_angles,
+    )
 
     n_full = len(filelist) * (len(filelist) - 1) // 2
     n_pairs = len(custom_pairs) if custom_pairs else n_full
