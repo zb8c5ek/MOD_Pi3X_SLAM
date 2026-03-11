@@ -749,21 +749,25 @@ def run_pipeline(config_path: str) -> int:
         # 5f. Export per-group COLMAP into VO/episode/group_NNN/sparse/
         logger.info("Exporting per-group COLMAP models...")
         sp = slam.submap_processor
+        max_export_pts = vo_cfg.get('output', {}).get('max_export_pts', 500000)
         exported_groups = export_per_submap_colmap(
-            str(vo_ep_out), sp.map, sp.graph, shared_K=shared_K)
+            str(vo_ep_out), sp.map, sp.graph, shared_K=shared_K,
+            max_export_pts=max_export_pts)
         logger.info("Exported %d groups", len(exported_groups))
 
         # 5f-2. Export per-submap COLMAP into SLAM/episode/submap_NNN/sparse/
         logger.info("Exporting per-submap COLMAP models (SLAM)...")
         exported_submaps = export_per_submap_colmap_slam(
-            str(slam_ep_out), sp.map, sp.graph, shared_K=shared_K)
+            str(slam_ep_out), sp.map, sp.graph, shared_K=shared_K,
+            max_export_pts=max_export_pts)
         logger.info("Exported %d submaps", len(exported_submaps))
 
         # 5f-3. Export unified COLMAP model (all cameras + all points + PLY)
         logger.info("Exporting unified COLMAP model...")
         unified_colmap_dir = slam_ep_out / "colmap"
         unified_result = export_all_colmap(
-            str(unified_colmap_dir), sp.map, sp.graph, shared_K=shared_K)
+            str(unified_colmap_dir), sp.map, sp.graph, shared_K=shared_K,
+            max_export_pts=max_export_pts)
         if unified_result:
             logger.info("Unified model: %d images, %d points -> %s",
                         unified_result["num_images"],
