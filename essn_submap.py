@@ -78,6 +78,9 @@ class SubmapProcessor:
         shadow_sl4: bool = False,
         shared_intrinsics=None,
         shared_intrinsics_hw=None,
+        n_views: int = 1,
+        view_keys: list = None,
+        images_dir: str = None,
     ):
         self.device = device
         self.dtype_torch = torch.float16 if dtype == "float16" else torch.bfloat16
@@ -98,6 +101,10 @@ class SubmapProcessor:
         self.shadow_sl4 = shadow_sl4
         self.shared_intrinsics = shared_intrinsics
         self.shared_intrinsics_hw = shared_intrinsics_hw
+        self.n_views = max(n_views, 1)
+        self.view_keys = view_keys
+        self.images_dir = images_dir
+
         if stitch_debug_dir:
             os.makedirs(stitch_debug_dir, exist_ok=True)
 
@@ -179,19 +186,58 @@ class SubmapProcessor:
             extrinsics = submap.get_all_poses_world(self.graph)
             images = submap.get_all_frames()
             print(f"[Rerun] Logging {extrinsics.shape[0]} camera poses for submap {submap.get_id()}")
-            self.rerun.log_submap_poses(submap.get_id(), extrinsics, images)
+            self.rerun.log_submap_poses(
+                submap.get_id(), extrinsics, images,
+                n_views=self.n_views, view_keys=self.view_keys,
+            )
         except Exception as e:
             print(f"[Rerun] ERROR in poses for submap {submap.get_id()}: {e}")
+            import traceback; traceback.print_exc()
+
+    def _export_submap_images(self, submap):
+        """Save keyframe images to images/submap_NNN/cam0/, cam1/, etc."""
+        if not self.images_dir:
+            return
+        try:
+            import cv2
+            images = submap.get_all_frames()
+            if isinstance(images, torch.Tensor):
+                images = images.cpu().numpy()
+            S = images.shape[0]
+            n_v = self.n_views
+            vk = self.view_keys or [f"cam{v}" for v in range(n_v)]
+            cam_labels = [k.split("_")[0] if "_" in k else k for k in vk]
+
+            submap_id = submap.get_id()
+            for img_id in range(S):
+                kf_idx = img_id // n_v
+                view_idx = img_id % n_v
+                cam_dir = os.path.join(
+                    self.images_dir, f"submap_{submap_id:03d}", cam_labels[view_idx],
+                )
+                os.makedirs(cam_dir, exist_ok=True)
+                img = images[img_id]  # (3, H, W)
+                if img.dtype in (np.float32, np.float64):
+                    img = (np.clip(img, 0, 1).transpose(1, 2, 0) * 255).astype(np.uint8)
+                else:
+                    img = img.transpose(1, 2, 0)
+                dst = os.path.join(cam_dir, f"kf_{kf_idx:03d}.jpg")
+                cv2.imwrite(dst, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            print(f"[Images] Exported {S} images for submap {submap_id} -> {self.images_dir}")
+        except Exception as e:
+            print(f"[Images] ERROR exporting submap {submap.get_id()}: {e}")
             import traceback; traceback.print_exc()
 
     def update_all_submap_vis(self):
         for submap in self.map.get_submaps():
             self._set_submap_point_cloud(submap)
             self._set_submap_poses(submap)
+            self._export_submap_images(submap)
 
     def update_latest_submap_vis(self):
         submap = self.map.get_latest_submap()
         self._set_submap_point_cloud(submap)
+        self._export_submap_images(submap)
         self._set_submap_poses(submap)
 
     # ------------------------------------------------------------------

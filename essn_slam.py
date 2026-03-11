@@ -99,6 +99,7 @@ class SLAMConfig:
     # Output
     colmap_output_path: Optional[str] = None
     log_poses_path: Optional[str] = None
+    images_dir: Optional[str] = None  # auto-set: images/{cam}/kf_NNN.jpg per submap
     output_dir: Optional[str] = None  # when set, all outputs go directly here (no automatic subfolder)
 
     # Shared intrinsics from upstream undistortion step (3x3 numpy or None)
@@ -186,6 +187,9 @@ class Pi3xSLAM:
             shadow_sl4=config.shadow_sl4,
             shared_intrinsics=config.shared_intrinsics,
             shared_intrinsics_hw=config.shared_intrinsics_hw,
+            n_views=len(self._view_keys) if self._view_keys else 1,
+            view_keys=self._view_keys or None,
+            images_dir=config.images_dir,
         )
         print("  [Phase 2 init] Models loaded.", flush=True)
 
@@ -209,6 +213,7 @@ class Pi3xSLAM:
                 ("stitch_debug_dir", "stitch_debug"),
                 ("colmap_output_path", "colmap"),
                 ("log_poses_path", "log_poses.txt"),
+                ("images_dir", "images"),
             ]
             if c.kf_save_debug_images:
                 dirs_to_create.insert(0, ("kf_debug_dir", "kf_debug"))

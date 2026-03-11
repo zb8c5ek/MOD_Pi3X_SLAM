@@ -5,9 +5,10 @@ Tier 1 (submap remap):
     build a COLMAP database, run the mapper, and dump .npz match caches.
 
 Tier 2 (keyframe remap):
-    For the unified KeyFrames/ folder (all cameras × all angles at KF
-    timestamps), load pre-computed matches from Tier 1 where applicable,
-    run MASt3R only on new pairs, then build a combined COLMAP reconstruction.
+    For the unified KeyFrames/ folder (same SLAM camera images merged from
+    all submaps), load pre-computed matches from Tier 1 where applicable,
+    run MASt3R only on cross-submap pairs, then build a combined COLMAP
+    reconstruction.
 
 Pure algorithm -- no config loading, no report generation.
 """
@@ -153,10 +154,11 @@ def remap_keyframes(
 ) -> Dict[str, Any]:
     """Run MASt3R + COLMAP on ``KeyFrames/`` with pre-computed match reuse.
 
-    1. Collects images from ``KeyFrames/cam{N}/angle/*.jpg``.
+    1. Collects images from ``KeyFrames/cam{N}/angle/*.jpg`` (same SLAM
+       camera images as in the per-submap folders, merged and deduped).
     2. Gathers all ``.npz`` match caches from ``submap_NNN/_matches/``
        (Tier 1 output).  Pairs already matched there are reused.
-    3. Runs MASt3R only on new pairs (cross-camera, cross-angle).
+    3. Runs MASt3R only on new cross-submap pairs not covered by Tier 1.
     4. Builds a COLMAP database from all matches and runs the mapper.
 
     Args:

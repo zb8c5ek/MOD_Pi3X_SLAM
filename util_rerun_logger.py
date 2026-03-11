@@ -110,13 +110,21 @@ class RerunLogger:
         submap_id: int,
         extrinsics: np.ndarray,
         images: np.ndarray,
+        n_views: int = 1,
+        view_keys: list = None,
     ):
         """Log camera poses, thumbnail images, and trajectory for one submap.
+
+        Frames are interleaved as [cam0_kf0, cam1_kf0, cam0_kf1, cam1_kf1, ...]
+        so ``n_views`` is used to de-interleave into keyframe × camera.
 
         Args:
             submap_id: Integer submap identifier.
             extrinsics: (S, 4, 4) cam2world matrices.
             images: (S, 3, H, W) image tensors (float 0-1 or uint8).
+            n_views: Number of physical cameras per keyframe timestamp.
+            view_keys: Optional camera names (length n_views).  Falls back
+                to ``["cam0", "cam1", ...]``.
         """
         if isinstance(images, torch.Tensor):
             images = images.cpu().numpy()
@@ -129,15 +137,31 @@ class RerunLogger:
         rr.set_time("submap", sequence=submap_id)
 
         S = extrinsics.shape[0]
-        centers = np.empty((S, 3), dtype=np.float32)
+        n_v = max(n_views, 1)
+        n_kf = S // n_v
+
+        cam_names = list(view_keys) if view_keys and len(view_keys) == n_v else [
+            f"cam{v}" for v in range(n_v)
+        ]
+        # Shorten long angle-encoded view keys (e.g. "cam0_p+0_y+30_r+0" -> "cam0")
+        cam_labels = [k.split("_")[0] if "_" in k else k for k in cam_names]
+
+        centers_per_cam = {v: [] for v in range(n_v)}
 
         for img_id in range(S):
-            cam2world = extrinsics[img_id]  # 4x4
-            entity = f"world/submap_{submap_id}/cam_{img_id:03d}"
+            kf_idx = img_id // n_v
+            view_idx = img_id % n_v
+            cam_label = cam_labels[view_idx]
 
+            if n_v > 1:
+                entity = f"world/submap_{submap_id}/kf_{kf_idx:03d}/{cam_label}"
+            else:
+                entity = f"world/submap_{submap_id}/kf_{kf_idx:03d}"
+
+            cam2world = extrinsics[img_id]  # 4x4
             t = cam2world[:3, 3]
             R = cam2world[:3, :3]
-            centers[img_id] = t
+            centers_per_cam[view_idx].append(t.astype(np.float32))
 
             rr.log(
                 entity,
@@ -167,11 +191,19 @@ class RerunLogger:
             )
             rr.log(f"{entity}/image", rr.Image(img))
 
-        if S >= 2:
+        for v in range(n_v):
+            pts = centers_per_cam[v]
+            if len(pts) < 2:
+                continue
+            trajectory = np.stack(pts)
+            cam_label = cam_labels[v]
+            traj_entity = (f"world/traj_{submap_id}/{cam_label}"
+                           if n_v > 1
+                           else f"world/traj_{submap_id}")
             rr.log(
-                f"world/traj_{submap_id}",
+                traj_entity,
                 rr.LineStrips3D(
-                    [centers],
+                    [trajectory],
                     colors=[color],
                     radii=[0.004],
                 ),
