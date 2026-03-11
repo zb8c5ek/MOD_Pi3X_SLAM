@@ -240,6 +240,11 @@ def export_all_colmap(colmap_output_path, map_store, graph, shared_K=None,
 
     if len(points) > 0:
         write_ply(colmap_output_path, points, colors)
+        lite_n = 150000
+        if len(points) > lite_n:
+            idx = np.random.choice(len(points), lite_n, replace=False)
+            write_ply(colmap_output_path, points[idx], colors[idx],
+                      filename="points3D_lite.ply")
 
     print(f"Unified COLMAP export: {len(poses)} images, {len(points)} points"
           f" -> {colmap_output_path}")
