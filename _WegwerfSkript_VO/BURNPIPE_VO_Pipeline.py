@@ -270,9 +270,13 @@ def _export_slam_outputs(
         slam_dir/
         ├── scene_graph.json
         ├── KeyFrames/
-        │   └── cam{N}/angle/<unique KFs from all submaps, SLAM cams only>
+        │   └── cam{N}/angle/<all cam/angle images at KF timestamps>
         └── submap_NNN/
             └── cam0/p+0_y+30_r+0/<keyframe images for this submap>
+
+    KeyFrames/ collects images for ALL cameras and angles available in
+    ``undistort_dir`` at keyframe timestamps -- not just the subset used
+    by SLAM.  Falls back to SLAM-only images if ``undistort_dir`` is None.
     """
     slam_dir.mkdir(parents=True, exist_ok=True)
 
@@ -306,40 +310,77 @@ def _export_slam_outputs(
     logger.info("  Staged %d keyframe images across %d submaps",
                 n_kf_images, len(sg["submaps"]))
 
-    # Unified KeyFrames/ folder: merge the SAME keyframe images from all
-    # submaps into one folder (deduped). Only SLAM cameras, same structure.
+    # Unified KeyFrames/ folder: collect ALL cam/angle images at keyframe
+    # timestamps from the undistort dir (not just SLAM cameras).
     kf_dir = slam_dir / "KeyFrames"
     kf_dir.mkdir(parents=True, exist_ok=True)
     n_kf_staged = 0
-    seen_kf = set()
+
+    kf_frame_indices = set()
     for sm in sg["submaps"]:
         for kf in sm["keyframes"]:
-            img_name = kf["image_name"]
-            if img_name in seen_kf:
+            if kf.get("frame_idx") is not None:
+                kf_frame_indices.add(kf["frame_idx"])
+
+    if undistort_dir and undistort_dir.is_dir():
+        for cam_dir in sorted(undistort_dir.iterdir()):
+            if not cam_dir.is_dir():
                 continue
-            seen_kf.add(img_name)
-            origin = Path(kf["origin_path"])
-            if not origin.is_file():
-                continue
-            m = _CAM_ANGLE_RE.search(img_name)
-            if m:
-                cam, angle = m.group(1), m.group(2)
-                dst = kf_dir / cam / angle / img_name
-            else:
-                dst = kf_dir / img_name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if dst.exists():
-                continue
-            if use_symlinks:
-                try:
-                    dst.symlink_to(origin)
-                except OSError:
+            for angle_dir in sorted(cam_dir.iterdir()):
+                if not angle_dir.is_dir():
+                    continue
+                cam, angle = cam_dir.name, angle_dir.name
+                for img in sorted(angle_dir.iterdir()):
+                    if img.suffix.lower() not in IMAGE_EXTS:
+                        continue
+                    m_idx = _FRAME_IDX_RE.match(img.name)
+                    if not m_idx or int(m_idx.group(1)) not in kf_frame_indices:
+                        continue
+                    dst = kf_dir / cam / angle / img.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.exists():
+                        continue
+                    if use_symlinks:
+                        try:
+                            dst.symlink_to(img)
+                        except OSError:
+                            shutil.copy2(str(img), str(dst))
+                    else:
+                        shutil.copy2(str(img), str(dst))
+                    n_kf_staged += 1
+        logger.info("  KeyFrames/: %d images (%d timestamps × all cams/angles from %s)",
+                    n_kf_staged, len(kf_frame_indices), undistort_dir)
+    else:
+        # Fallback: only SLAM keyframe images (no undistort_dir available)
+        seen_kf = set()
+        for sm in sg["submaps"]:
+            for kf in sm["keyframes"]:
+                img_name = kf["image_name"]
+                if img_name in seen_kf:
+                    continue
+                seen_kf.add(img_name)
+                origin = Path(kf["origin_path"])
+                if not origin.is_file():
+                    continue
+                m = _CAM_ANGLE_RE.search(img_name)
+                if m:
+                    cam, angle = m.group(1), m.group(2)
+                    dst = kf_dir / cam / angle / img_name
+                else:
+                    dst = kf_dir / img_name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists():
+                    continue
+                if use_symlinks:
+                    try:
+                        dst.symlink_to(origin)
+                    except OSError:
+                        shutil.copy2(str(origin), str(dst))
+                else:
                     shutil.copy2(str(origin), str(dst))
-            else:
-                shutil.copy2(str(origin), str(dst))
-            n_kf_staged += 1
-    logger.info("  KeyFrames/: %d unique images (from %d submaps, SLAM cams only)",
-                n_kf_staged, len(sg["submaps"]))
+                n_kf_staged += 1
+        logger.warning("  KeyFrames/: %d images (SLAM cams only, no undistort_dir)",
+                       n_kf_staged)
 
     # Non-KF → KF association
     kf_frame_set = set()
