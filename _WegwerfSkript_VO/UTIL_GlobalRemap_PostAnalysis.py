@@ -664,8 +664,8 @@ def run_rerun_visualization(
                static=True)
         logger.info("Logged %d 3D points", len(pts_xyz))
 
-    # -- Registered cameras (colored by cam) --
-    cam_positions: Dict[str, List[np.ndarray]] = defaultdict(list)
+    # -- Registered cameras (colored by cam, sorted by timestamp for trajectory) --
+    cam_frame_poses: Dict[str, List[Tuple[int, np.ndarray, np.ndarray]]] = defaultdict(list)
     for img in recon.images.values():
         if hasattr(img, "has_pose") and not img.has_pose:
             continue
@@ -674,25 +674,40 @@ def run_rerun_visualization(
             continue
 
         center = np.array(img.projection_center())
-        cam_positions[info.cam].append(center)
-
         T = _get_cam_from_world(img)
-        R = T[:3, :3]
+        R_world = np.linalg.inv(T[:3, :3])
+        cam_frame_poses[info.cam].append((int(info.frame_idx), center, R_world))
+
         color = CAM_COLORS.get(info.cam, [200, 200, 200, 255])
-        frustum = build_frustum_lines(center, np.linalg.inv(R), scale=0.06)
+        frustum = build_frustum_lines(center, R_world, scale=0.06)
         rr.log(f"world/cameras/{info.cam}/{info.subfolder}/{info.frame_idx}",
                rr.LineStrips3D(frustum, colors=[color] * len(frustum), radii=[0.001]),
                static=True)
 
-    for cam_name, positions in cam_positions.items():
+    # Log per-cam trajectory as a line strip sorted by frame_idx
+    for cam_name in sorted(cam_frame_poses):
+        entries = sorted(cam_frame_poses[cam_name], key=lambda e: e[0])
+        positions = np.array([e[1] for e in entries])
+        color = CAM_COLORS.get(cam_name, [200, 200, 200, 255])
         if len(positions) >= 2:
-            arr = np.array(positions)
-            color = CAM_COLORS.get(cam_name, [200, 200, 200, 255])
-            rr.log(f"world/cameras/{cam_name}/positions",
-                   rr.Points3D(arr, colors=[color] * len(arr), radii=[0.008]),
+            rr.log(f"world/cameras/{cam_name}/trajectory",
+                   rr.LineStrips3D([positions], colors=[color], radii=[0.003]),
                    static=True)
+        rr.log(f"world/cameras/{cam_name}/positions",
+               rr.Points3D(positions, colors=[color] * len(positions), radii=[0.008]),
+               static=True)
+
+        # Time-varying camera pose for scrubbing
+        for fidx, center, R_world in entries:
+            rr.set_time_sequence("frame_idx", fidx)
+            rr.log(f"world/cameras/{cam_name}/current",
+                   rr.Points3D([center], colors=[color], radii=[0.015]))
+            frustum = build_frustum_lines(center, R_world, scale=0.08)
+            rr.log(f"world/cameras/{cam_name}/current_frustum",
+                   rr.LineStrips3D(frustum, colors=[color] * len(frustum), radii=[0.002]))
+
     logger.info("Logged %d registered camera poses",
-                sum(len(v) for v in cam_positions.values()))
+                sum(len(v) for v in cam_frame_poses.values()))
 
     # -- SLAM trajectory from scene graph --
     if scene_graph_json and scene_graph_json.is_file():
@@ -700,25 +715,52 @@ def run_rerun_visualization(
             sg = json.load(f)
 
         submaps = sg.get("submaps", [])
+        all_slam_positions = []  # for unified trajectory line
+
         for i, submap in enumerate(submaps):
+            sid = submap.get("submap_id", i)
             color = SUBMAP_COLORS[i % len(SUBMAP_COLORS)]
-            kf_positions = []
+            kf_entries = []
             for kf in submap.get("keyframes", []):
                 pose = kf.get("pose_cam2world_global")
-                if pose and len(pose) >= 12:
-                    mat = np.array(pose).reshape(3, 4) if len(pose) == 12 else np.array(pose).reshape(4, 4)[:3]
-                    kf_positions.append(mat[:, 3])
+                fidx = kf.get("frame_idx")
+                if pose is None or fidx is None:
+                    continue
+                # pose is a 4x4 nested list: [[r00,r01,r02,tx],[r10,...],...]
+                mat = np.array(pose)
+                pos = mat[:3, 3]
+                kf_entries.append((fidx, pos))
 
-            if len(kf_positions) >= 2:
-                arr = np.array(kf_positions)
-                rr.log(f"world/slam_trajectory/submap_{i:03d}",
-                       rr.LineStrips3D([arr], colors=[color], radii=[0.005]),
-                       static=True)
-                rr.log(f"world/slam_trajectory/submap_{i:03d}/keyframes",
-                       rr.Points3D(arr, colors=[color] * len(arr), radii=[0.012]),
+            kf_entries.sort(key=lambda e: e[0])
+
+            if kf_entries:
+                positions = np.array([e[1] for e in kf_entries])
+                all_slam_positions.extend(kf_entries)
+
+                if len(positions) >= 2:
+                    rr.log(f"world/slam_trajectory/submap_{sid:03d}",
+                           rr.LineStrips3D([positions], colors=[color], radii=[0.005]),
+                           static=True)
+                rr.log(f"world/slam_trajectory/submap_{sid:03d}/keyframes",
+                       rr.Points3D(positions, colors=[color] * len(positions), radii=[0.012]),
                        static=True)
 
-        logger.info("Logged SLAM trajectory (%d submaps)", len(submaps))
+                # Time-varying SLAM pose for scrubbing alongside COLMAP cameras
+                for fidx, pos in kf_entries:
+                    rr.set_time_sequence("frame_idx", fidx)
+                    rr.log(f"world/slam_trajectory/current",
+                           rr.Points3D([pos], colors=[[255, 255, 0, 255]], radii=[0.02]))
+
+        # Unified trajectory line across all submaps (sorted by frame_idx)
+        if len(all_slam_positions) >= 2:
+            all_slam_positions.sort(key=lambda e: e[0])
+            unified = np.array([e[1] for e in all_slam_positions])
+            rr.log("world/slam_trajectory/unified",
+                   rr.LineStrips3D([unified], colors=[[255, 255, 0, 180]], radii=[0.002]),
+                   static=True)
+
+        logger.info("Logged SLAM trajectory (%d submaps, %d keyframes)",
+                    len(submaps), len(all_slam_positions))
 
     logger.info("Rerun visualization complete")
 
