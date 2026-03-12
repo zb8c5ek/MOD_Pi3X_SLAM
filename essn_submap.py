@@ -228,17 +228,64 @@ class SubmapProcessor:
             print(f"[Images] ERROR exporting submap {submap.get_id()}: {e}")
             import traceback; traceback.print_exc()
 
+    def _collect_all_centers(self):
+        """Collect camera centers for all non-LC submaps (for trajectory lines).
+
+        Returns:
+            List of ``(submap_id, {view_idx: [center_array, ...]})`` sorted
+            by submap_id, plus ``cam_labels`` list.
+        """
+        n_v = max(self.n_views, 1)
+        vk = self.view_keys or [f"cam{v}" for v in range(n_v)]
+        cam_labels = [k.split("_")[0] if "_" in k else k for k in vk]
+
+        all_centers = []
+        for submap in self.map.ordered_submaps_by_key():
+            if submap.get_lc_status():
+                continue
+            try:
+                extrinsics = submap.get_all_poses_world(self.graph)
+            except Exception:
+                continue
+            if not np.isfinite(extrinsics).all():
+                continue
+            S = extrinsics.shape[0]
+            cpc = {v: [] for v in range(n_v)}
+            for img_id in range(S):
+                view_idx = img_id % n_v
+                cpc[view_idx].append(extrinsics[img_id, :3, 3].astype(np.float32))
+            all_centers.append((submap.get_id(), cpc))
+        return all_centers, cam_labels
+
+    def _update_all_trajectories(self):
+        """Re-log all trajectory lines (per-submap + unified) without re-logging
+        point clouds or images.  Lightweight refresh after graph optimization."""
+        if not self.rerun:
+            return
+        try:
+            all_centers, cam_labels = self._collect_all_centers()
+            self.rerun.log_all_trajectories(
+                all_centers,
+                n_views=self.n_views,
+                cam_labels=cam_labels,
+            )
+        except Exception as e:
+            print(f"[Rerun] ERROR in trajectory refresh: {e}")
+            import traceback; traceback.print_exc()
+
     def update_all_submap_vis(self):
         for submap in self.map.get_submaps():
             self._set_submap_point_cloud(submap)
             self._set_submap_poses(submap)
             self._export_submap_images(submap)
+        self._update_all_trajectories()
 
     def update_latest_submap_vis(self):
         submap = self.map.get_latest_submap()
         self._set_submap_point_cloud(submap)
         self._export_submap_images(submap)
         self._set_submap_poses(submap)
+        self._update_all_trajectories()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -519,6 +566,7 @@ class SubmapProcessor:
             lc_submap.set_lc_status(True)
             lc_submap.add_all_frames(lc_data['frames'])
             lc_submap.set_frame_ids(lc_data['frame_names'])
+            lc_submap.set_img_names(lc_data['frame_names'])
             lc_submap.set_last_non_loop_frame_index(1)
 
             lc_submap.add_all_poses(lc_data['cam2world'])

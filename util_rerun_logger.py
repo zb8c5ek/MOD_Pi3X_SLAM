@@ -160,7 +160,9 @@ class RerunLogger:
 
             cam2world = extrinsics[img_id]  # 4x4
             t = cam2world[:3, 3]
-            R = cam2world[:3, :3]
+            sR = cam2world[:3, :3]
+            s = np.cbrt(np.linalg.det(sR))
+            R = sR / max(abs(s), 1e-12)
             centers_per_cam[view_idx].append(t.astype(np.float32))
 
             rr.log(
@@ -186,6 +188,7 @@ class RerunLogger:
                     focal_length=[fx, fy],
                     width=w,
                     height=h,
+                    camera_xyz=rr.ViewCoordinates.RDF,
                     image_plane_distance=0.07,
                 ),
             )
@@ -208,6 +211,96 @@ class RerunLogger:
                     radii=[0.004],
                 ),
             )
+
+    # ------------------------------------------------------------------
+    # Unified trajectory across all submaps
+    # ------------------------------------------------------------------
+
+    def log_unified_trajectory(
+        self,
+        all_centers: list,
+        n_views: int = 1,
+        cam_labels: list = None,
+    ):
+        """Log a single continuous trajectory line across all submaps.
+
+        Args:
+            all_centers: List of (submap_id, centers_per_cam) tuples, where
+                centers_per_cam is ``{view_idx: list_of_float32_xyz}``.
+                Must be sorted by submap_id.
+            n_views: Number of physical cameras per timestamp.
+            cam_labels: Camera names (length n_views).
+        """
+        if not all_centers:
+            return
+
+        n_v = max(n_views, 1)
+        labels = cam_labels or [f"cam{v}" for v in range(n_v)]
+
+        for v in range(n_v):
+            pts = []
+            for _sid, cpc in all_centers:
+                pts.extend(cpc.get(v, []))
+            if len(pts) < 2:
+                continue
+            trajectory = np.stack(pts)
+            entity = (f"world/trajectory_unified/{labels[v]}"
+                      if n_v > 1
+                      else "world/trajectory_unified")
+            rr.log(
+                entity,
+                rr.LineStrips3D(
+                    [trajectory],
+                    colors=[[255, 255, 0]],
+                    radii=[0.006],
+                ),
+            )
+
+    def log_all_trajectories(
+        self,
+        all_centers: list,
+        n_views: int = 1,
+        cam_labels: list = None,
+    ):
+        """Re-log per-submap trajectory lines and the unified trajectory.
+
+        Lightweight alternative to full ``log_submap_poses`` -- only updates
+        line geometry, no images or Transform3D entities.
+
+        Args:
+            all_centers: Same format as ``log_unified_trajectory``.
+            n_views: Number of physical cameras per timestamp.
+            cam_labels: Camera names (length n_views).
+        """
+        if not all_centers:
+            return
+
+        n_v = max(n_views, 1)
+        labels = cam_labels or [f"cam{v}" for v in range(n_v)]
+
+        for sid, cpc in all_centers:
+            color = self._color_for_submap(sid)
+            rr.set_time("submap", sequence=sid)
+            for v in range(n_v):
+                pts = cpc.get(v, [])
+                if len(pts) < 2:
+                    continue
+                trajectory = np.stack(pts)
+                traj_entity = (f"world/traj_{sid}/{labels[v]}"
+                               if n_v > 1
+                               else f"world/traj_{sid}")
+                rr.log(
+                    traj_entity,
+                    rr.LineStrips3D(
+                        [trajectory],
+                        colors=[color],
+                        radii=[0.004],
+                    ),
+                )
+
+        latest_sid = all_centers[-1][0] if all_centers else 0
+        rr.set_time("submap", sequence=latest_sid)
+        self.log_unified_trajectory(all_centers, n_views, labels)
 
     # ------------------------------------------------------------------
     # OBB wireframes

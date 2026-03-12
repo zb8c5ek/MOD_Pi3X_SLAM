@@ -634,21 +634,56 @@ def _get_cam_from_world(image):
     return np.array(cfw)
 
 
+def _pick_primary_angle(
+    subfolder_counts: Dict[str, int],
+    cam: str,
+) -> str:
+    """Choose the most frequently registered angle for a physical camera."""
+    candidates = {sf: n for sf, n in subfolder_counts.items()
+                  if sf.startswith(f"{cam}_")}
+    if not candidates:
+        return ""
+    return max(candidates, key=candidates.get)
+
+
 def run_rerun_visualization(
     recon,
     staged_images: List[ImageInfo],
     registered_names: Set[str],
     scene_graph_json: Optional[Path],
     save_path: str = "",
+    images_dir: Optional[Path] = None,
 ):
-    """Visualize COLMAP reconstruction + SLAM trajectory in Rerun."""
+    """Visualize COLMAP reconstruction + SLAM trajectory in Rerun.
+
+    Trajectory lines are drawn **per physical camera** using one
+    representative angle per timestamp (the most-registered angle).
+    All subfolder frustums are still shown for detail.
+
+    Args:
+        images_dir: Root of ``colmap_project/images/`` for loading thumbnails.
+    """
     import rerun as rr
+    import rerun.blueprint as rrb
 
     rr.init("global_remap_analysis", spawn=not save_path)
     if save_path:
         rr.save(save_path)
 
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+
+    # Blueprint: 3D scene + optional 2D image panel
+    blueprint = rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Spatial3DView(name="3D Scene", origin="world"),
+            rrb.Vertical(
+                rrb.Spatial2DView(name="Current Image",
+                                  origin="images/current"),
+            ),
+            column_shares=[3, 1],
+        ),
+    )
+    rr.send_blueprint(blueprint)
 
     # -- 3D point cloud --
     pts_xyz = []
@@ -664,8 +699,13 @@ def run_rerun_visualization(
                static=True)
         logger.info("Logged %d 3D points", len(pts_xyz))
 
-    # -- Registered cameras (colored by cam, sorted by timestamp for trajectory) --
-    cam_frame_poses: Dict[str, List[Tuple[int, np.ndarray, np.ndarray]]] = defaultdict(list)
+    # -- Collect registered camera data per subfolder and per physical cam --
+    # pose_entry: (frame_idx, center, R_world, subfolder, relpath)
+    PoseEntry = Tuple[int, np.ndarray, np.ndarray, str, str]
+    cam_subfolder_poses: Dict[str, Dict[str, List[PoseEntry]]] = defaultdict(
+        lambda: defaultdict(list))
+    subfolder_reg_count: Dict[str, int] = Counter()
+
     for img in recon.images.values():
         if hasattr(img, "has_pose") and not img.has_pose:
             continue
@@ -676,7 +716,9 @@ def run_rerun_visualization(
         center = np.array(img.projection_center())
         T = _get_cam_from_world(img)
         R_world = np.linalg.inv(T[:3, :3])
-        cam_frame_poses[info.cam].append((int(info.frame_idx), center, R_world))
+        entry = (int(info.frame_idx), center, R_world, info.subfolder, img.name)
+        cam_subfolder_poses[info.cam][info.subfolder].append(entry)
+        subfolder_reg_count[info.subfolder] += 1
 
         color = CAM_COLORS.get(info.cam, [200, 200, 200, 255])
         frustum = build_frustum_lines(center, R_world, scale=0.06)
@@ -684,30 +726,71 @@ def run_rerun_visualization(
                rr.LineStrips3D(frustum, colors=[color] * len(frustum), radii=[0.001]),
                static=True)
 
-    # Log per-cam trajectory as a line strip sorted by frame_idx
-    for cam_name in sorted(cam_frame_poses):
-        entries = sorted(cam_frame_poses[cam_name], key=lambda e: e[0])
-        positions = np.array([e[1] for e in entries])
+    # -- Per physical camera: pick primary angle, build clean trajectory --
+    total_logged = 0
+    for cam_name in sorted(cam_subfolder_poses):
+        primary_sf = _pick_primary_angle(subfolder_reg_count, cam_name)
+        if not primary_sf:
+            continue
         color = CAM_COLORS.get(cam_name, [200, 200, 200, 255])
+
+        # Build timestamp -> best pose map (prefer primary angle)
+        ts_best: Dict[int, PoseEntry] = {}
+        for sf, entries in cam_subfolder_poses[cam_name].items():
+            for entry in entries:
+                fidx = entry[0]
+                is_primary = (sf == primary_sf)
+                if fidx not in ts_best or is_primary:
+                    ts_best[fidx] = entry
+
+        sorted_entries = sorted(ts_best.values(), key=lambda e: e[0])
+        if not sorted_entries:
+            continue
+
+        positions = np.array([e[1] for e in sorted_entries])
+        total_logged += len(positions)
+
+        # Static trajectory line
         if len(positions) >= 2:
             rr.log(f"world/cameras/{cam_name}/trajectory",
                    rr.LineStrips3D([positions], colors=[color], radii=[0.003]),
                    static=True)
         rr.log(f"world/cameras/{cam_name}/positions",
-               rr.Points3D(positions, colors=[color] * len(positions), radii=[0.008]),
+               rr.Points3D(positions, colors=[color] * len(positions),
+                            radii=[0.008]),
                static=True)
 
-        # Time-varying camera pose for scrubbing
-        for fidx, center, R_world in entries:
+        # Time-varying camera pose + image for scrubbing
+        for fidx, center, R_world, subfolder, relpath in sorted_entries:
             rr.set_time_sequence("frame_idx", fidx)
             rr.log(f"world/cameras/{cam_name}/current",
                    rr.Points3D([center], colors=[color], radii=[0.015]))
             frustum = build_frustum_lines(center, R_world, scale=0.08)
             rr.log(f"world/cameras/{cam_name}/current_frustum",
-                   rr.LineStrips3D(frustum, colors=[color] * len(frustum), radii=[0.002]))
+                   rr.LineStrips3D(frustum, colors=[color] * len(frustum),
+                                   radii=[0.002]))
 
-    logger.info("Logged %d registered camera poses",
-                sum(len(v) for v in cam_frame_poses.values()))
+            # Load and display keyframe image if available
+            if images_dir is not None:
+                img_path = images_dir / relpath
+                if img_path.is_file():
+                    try:
+                        import cv2
+                        bgr = cv2.imread(str(img_path))
+                        if bgr is not None:
+                            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                            h, w = rgb.shape[:2]
+                            max_dim = 320
+                            if max(h, w) > max_dim:
+                                scale = max_dim / max(h, w)
+                                rgb = cv2.resize(rgb, None, fx=scale, fy=scale)
+                            rr.log(f"images/current/{cam_name}",
+                                   rr.Image(rgb))
+                    except Exception:
+                        pass
+
+    logger.info("Logged %d registered camera poses (trajectory from primary angle)",
+                total_logged)
 
     # -- SLAM trajectory from scene graph --
     if scene_graph_json and scene_graph_json.is_file():
@@ -715,7 +798,7 @@ def run_rerun_visualization(
             sg = json.load(f)
 
         submaps = sg.get("submaps", [])
-        all_slam_positions = []  # for unified trajectory line
+        all_slam_positions = []
 
         for i, submap in enumerate(submaps):
             sid = submap.get("submap_id", i)
@@ -726,7 +809,6 @@ def run_rerun_visualization(
                 fidx = kf.get("frame_idx")
                 if pose is None or fidx is None:
                     continue
-                # pose is a 4x4 nested list: [[r00,r01,r02,tx],[r10,...],...]
                 mat = np.array(pose)
                 pos = mat[:3, 3]
                 kf_entries.append((fidx, pos))
@@ -739,24 +821,27 @@ def run_rerun_visualization(
 
                 if len(positions) >= 2:
                     rr.log(f"world/slam_trajectory/submap_{sid:03d}",
-                           rr.LineStrips3D([positions], colors=[color], radii=[0.005]),
+                           rr.LineStrips3D([positions], colors=[color],
+                                           radii=[0.005]),
                            static=True)
                 rr.log(f"world/slam_trajectory/submap_{sid:03d}/keyframes",
-                       rr.Points3D(positions, colors=[color] * len(positions), radii=[0.012]),
+                       rr.Points3D(positions,
+                                   colors=[color] * len(positions),
+                                   radii=[0.012]),
                        static=True)
 
-                # Time-varying SLAM pose for scrubbing alongside COLMAP cameras
                 for fidx, pos in kf_entries:
                     rr.set_time_sequence("frame_idx", fidx)
-                    rr.log(f"world/slam_trajectory/current",
-                           rr.Points3D([pos], colors=[[255, 255, 0, 255]], radii=[0.02]))
+                    rr.log("world/slam_trajectory/current",
+                           rr.Points3D([pos], colors=[[255, 255, 0, 255]],
+                                       radii=[0.02]))
 
-        # Unified trajectory line across all submaps (sorted by frame_idx)
         if len(all_slam_positions) >= 2:
             all_slam_positions.sort(key=lambda e: e[0])
             unified = np.array([e[1] for e in all_slam_positions])
             rr.log("world/slam_trajectory/unified",
-                   rr.LineStrips3D([unified], colors=[[255, 255, 0, 180]], radii=[0.002]),
+                   rr.LineStrips3D([unified], colors=[[255, 255, 0, 180]],
+                                   radii=[0.002]),
                    static=True)
 
         logger.info("Logged SLAM trajectory (%d submaps, %d keyframes)",
@@ -874,9 +959,11 @@ def main():
     # -- Section 5: Rerun --
     if args.rerun or args.save:
         logger.info("Launching Rerun visualization...")
+        colmap_images_dir = colmap_project / "images"
         run_rerun_visualization(
             recon, staged_images, reg["registered_names"],
             scene_graph_json, save_path=args.save,
+            images_dir=colmap_images_dir if colmap_images_dir.is_dir() else None,
         )
 
     print("\n" + "=" * 60)

@@ -45,11 +45,13 @@ def _build_submap_data(sg: Dict) -> Dict[str, Any]:
     Returns dict with:
       submap_centroids: {submap_id: (x,y,z)}
       kf_positions:     {frame_idx: (x,y,z)}  (first cam only, deduped)
+      kf_cam_positions: {(frame_idx, cam_name): (x,y,z)}  per-camera poses
       submap_kf_fidxs:  {submap_id: [frame_idx, ...]}
       fidx_to_submap:   {frame_idx: submap_id}  (first submap seen)
     """
     submap_centroids: Dict[int, np.ndarray] = {}
     kf_positions: Dict[int, np.ndarray] = {}
+    kf_cam_positions: Dict[Tuple[int, str], np.ndarray] = {}
     submap_kf_fidxs: Dict[int, List[int]] = {}
     fidx_to_submap: Dict[int, int] = {}
 
@@ -65,6 +67,11 @@ def _build_submap_data(sg: Dict) -> Dict[str, Any]:
                 continue
             pose = kf["pose_cam2world_global"]
             pos = np.array([pose[0][3], pose[1][3], pose[2][3]])
+
+            img_name = kf.get("image_name", "")
+            m = _CAM_NAME_RE.search(img_name)
+            cam = m.group(1) if m else "cam0"
+            kf_cam_positions[(fidx, cam)] = pos
 
             if fidx not in fidxs_seen:
                 fidxs_seen.add(fidx)
@@ -83,6 +90,7 @@ def _build_submap_data(sg: Dict) -> Dict[str, Any]:
     return {
         "submap_centroids": submap_centroids,
         "kf_positions": kf_positions,
+        "kf_cam_positions": kf_cam_positions,
         "submap_kf_fidxs": submap_kf_fidxs,
         "fidx_to_submap": fidx_to_submap,
     }
@@ -126,104 +134,140 @@ def _aggregate_matches_to_submaps(
     return counts
 
 
+_CAM_NAME_RE = re.compile(r"(cam\d+)")
+
+
+def _cam_from_subfolder(sf: str) -> str:
+    m = _CAM_NAME_RE.search(sf)
+    return m.group(1) if m else sf
+
+
 def _build_joint_graph_figure(
     joint_label: str,
     joint_pairs: List[Tuple[str, str]],
     kf_positions: Dict[int, np.ndarray],
+    kf_cam_positions: Dict[Tuple[int, str], np.ndarray],
     fidx_to_submap: Dict[int, int],
     sm_color: Dict[int, str],
 ) -> "go.Figure":
     """Build a 3D Plotly figure showing the pair graph for one joint.
 
-    Nodes are keyframe positions (colored by submap).  Edges are pair
-    connections colored by type: green=stereo (same timestamp, diff cam),
-    blue=temporal (same cam+angle, diff timestamp).
+    Nodes use real per-camera 3D poses from the scene graph (each camera on
+    the rig has a distinct position/orientation).  Edges are colored by type:
+    green=stereo (same timestamp, diff cam), blue=temporal (same cam, diff
+    timestamp), orange=cross-cam (diff timestamp AND diff cam).
     """
     import plotly.graph_objects as go
 
     fig = go.Figure()
 
-    # Collect unique frame indices referenced by these pairs
+    # Collect unique (frame_idx, camera) nodes referenced by pairs
     involved_fidxs: Set[int] = set()
+    involved_nodes: Set[Tuple[int, str]] = set()
     for rp_a, rp_b in joint_pairs:
-        fa = _extract_frame_idx(rp_a.rsplit("/", 1)[-1])
-        fb = _extract_frame_idx(rp_b.rsplit("/", 1)[-1])
-        if fa is not None:
-            involved_fidxs.add(fa)
-        if fb is not None:
-            involved_fidxs.add(fb)
+        for rp in (rp_a, rp_b):
+            fidx = _extract_frame_idx(rp.rsplit("/", 1)[-1])
+            sf = rp.split("/")[0] if "/" in rp else ""
+            cam = _cam_from_subfolder(sf)
+            if fidx is not None:
+                involved_fidxs.add(fidx)
+                involved_nodes.add((fidx, cam))
 
-    # Keyframe positions as nodes
-    sm_fidx_groups: Dict[int, List[int]] = {}
-    for fidx in sorted(involved_fidxs):
+    def _node_pos(fidx: int, cam: str) -> Optional[np.ndarray]:
+        """Look up real camera position; fall back to rig-centre."""
+        pos = kf_cam_positions.get((fidx, cam))
+        if pos is not None:
+            return pos
+        return kf_positions.get(fidx)
+
+    sorted_cams = sorted({c for _, c in involved_nodes})
+
+    # Keyframe positions as nodes — one marker set per (submap, camera)
+    sm_cam_groups: Dict[Tuple[int, str], List[Tuple[int, np.ndarray]]] = {}
+    for fidx, cam in sorted(involved_nodes):
         sid = fidx_to_submap.get(fidx)
-        if sid is not None:
-            sm_fidx_groups.setdefault(sid, []).append(fidx)
+        if sid is None:
+            continue
+        pos = _node_pos(fidx, cam)
+        if pos is not None:
+            sm_cam_groups.setdefault((sid, cam), []).append((fidx, pos))
 
-    for sid, fidxs in sorted(sm_fidx_groups.items()):
-        xs, ys, zs, texts = [], [], [], []
-        for fidx in fidxs:
-            pos = kf_positions.get(fidx)
-            if pos is not None:
-                xs.append(pos[0]); ys.append(pos[1]); zs.append(pos[2])
-                texts.append(f"f{fidx} sm{sid}")
-        if xs:
-            fig.add_trace(go.Scatter3d(
-                x=xs, y=ys, z=zs, mode="markers",
-                marker=dict(size=4, color=sm_color.get(sid, "gray")),
-                text=texts, hoverinfo="text",
-                name=f"sm{sid:03d}", legendgroup=f"sm{sid}",
-            ))
+    cam_marker = {"cam0": "circle", "cam1": "diamond",
+                  "cam2": "square", "cam3": "cross"}
+    for (sid, cam), entries in sorted(sm_cam_groups.items()):
+        xs = [p[0] for _, p in entries]
+        ys = [p[1] for _, p in entries]
+        zs = [p[2] for _, p in entries]
+        texts = [f"f{fidx} sm{sid} {cam}" for fidx, _ in entries]
+        fig.add_trace(go.Scatter3d(
+            x=xs, y=ys, z=zs, mode="markers",
+            marker=dict(size=4, color=sm_color.get(sid, "gray"),
+                        symbol=cam_marker.get(cam, "circle")),
+            text=texts, hoverinfo="text",
+            name=f"sm{sid:03d}/{cam}", legendgroup=f"sm{sid}",
+            showlegend=(cam == sorted_cams[0]),
+        ))
 
-    # Classify and draw pair edges
-    stereo_lines_x, stereo_lines_y, stereo_lines_z = [], [], []
-    temporal_lines_x, temporal_lines_y, temporal_lines_z = [], [], []
-
+    # Classify and draw pair edges: stereo / temporal / cross-camera
+    edge_bins: Dict[str, List[List[float]]] = {
+        "stereo": [[], [], []], "temporal": [[], [], []], "cross": [[], [], []],
+    }
     for rp_a, rp_b in joint_pairs:
         fa = _extract_frame_idx(rp_a.rsplit("/", 1)[-1])
         fb = _extract_frame_idx(rp_b.rsplit("/", 1)[-1])
         if fa is None or fb is None:
             continue
-        pos_a = kf_positions.get(fa)
-        pos_b = kf_positions.get(fb)
-        if pos_a is None or pos_b is None:
-            continue
-
         sf_a = rp_a.split("/")[0] if "/" in rp_a else ""
         sf_b = rp_b.split("/")[0] if "/" in rp_b else ""
-        is_stereo = (fa == fb and sf_a != sf_b)
+        cam_a, cam_b = _cam_from_subfolder(sf_a), _cam_from_subfolder(sf_b)
+        pa = _node_pos(fa, cam_a)
+        pb = _node_pos(fb, cam_b)
+        if pa is None or pb is None:
+            continue
 
-        if is_stereo:
-            stereo_lines_x.extend([pos_a[0], pos_b[0], None])
-            stereo_lines_y.extend([pos_a[1], pos_b[1], None])
-            stereo_lines_z.extend([pos_a[2], pos_b[2], None])
+        same_ts = (fa == fb)
+        same_cam = (cam_a == cam_b)
+
+        if same_ts and not same_cam:
+            key = "stereo"
+        elif not same_ts and same_cam:
+            key = "temporal"
         else:
-            temporal_lines_x.extend([pos_a[0], pos_b[0], None])
-            temporal_lines_y.extend([pos_a[1], pos_b[1], None])
-            temporal_lines_z.extend([pos_a[2], pos_b[2], None])
+            key = "cross"
 
-    if temporal_lines_x:
+        edge_bins[key][0].extend([pa[0], pb[0], None])
+        edge_bins[key][1].extend([pa[1], pb[1], None])
+        edge_bins[key][2].extend([pa[2], pb[2], None])
+
+    edge_style = {
+        "temporal": ("temporal", dict(width=1, color="rgba(50,100,220,0.3)")),
+        "stereo":  ("stereo",   dict(width=2, color="rgba(0,180,0,0.5)")),
+        "cross":   ("cross-cam", dict(width=1.5, color="rgba(220,120,0,0.5)")),
+    }
+    for key in ("temporal", "stereo", "cross"):
+        lx, ly, lz = edge_bins[key]
+        if not lx:
+            continue
+        label, style = edge_style[key]
         fig.add_trace(go.Scatter3d(
-            x=temporal_lines_x, y=temporal_lines_y, z=temporal_lines_z,
-            mode="lines", line=dict(width=1, color="rgba(50,100,220,0.3)"),
-            name="temporal", hoverinfo="skip",
-        ))
-    if stereo_lines_x:
-        fig.add_trace(go.Scatter3d(
-            x=stereo_lines_x, y=stereo_lines_y, z=stereo_lines_z,
-            mode="lines", line=dict(width=2, color="rgba(0,180,0,0.5)"),
-            name="stereo", hoverinfo="skip",
+            x=lx, y=ly, z=lz,
+            mode="lines", line=style,
+            name=label, hoverinfo="skip",
         ))
 
-    n_stereo = len([x for x in stereo_lines_x if x is not None]) // 2
-    n_temporal = len([x for x in temporal_lines_x if x is not None]) // 2
+    def _count(bins: List[List[float]]) -> int:
+        return len([x for x in bins[0] if x is not None]) // 2
+
+    n_stereo = _count(edge_bins["stereo"])
+    n_temporal = _count(edge_bins["temporal"])
+    n_cross = _count(edge_bins["cross"])
     fig.update_layout(
         title=dict(
             text=(f"<b>{joint_label}</b><br>"
                   f"<span style='font-size:12px'>"
                   f"{len(involved_fidxs)} timestamps | "
                   f"{len(joint_pairs)} pairs "
-                  f"({n_stereo} stereo + {n_temporal} temporal)"
+                  f"({n_stereo} stereo + {n_temporal} temporal + {n_cross} cross-cam)"
                   f"</span>"),
             x=0.5,
         ),
@@ -265,6 +309,7 @@ def generate_report(
     sd = _build_submap_data(sg)
     centroids = sd["submap_centroids"]
     kf_positions = sd["kf_positions"]
+    kf_cam_positions = sd["kf_cam_positions"]
     submap_kf_fidxs = sd["submap_kf_fidxs"]
     fidx_to_submap = sd["fidx_to_submap"]
 
@@ -498,7 +543,8 @@ def generate_report(
                 continue
             jfig = _build_joint_graph_figure(
                 jmeta["label"], jpairs,
-                kf_positions, fidx_to_submap, sm_color,
+                kf_positions, kf_cam_positions,
+                fidx_to_submap, sm_color,
             )
             graph_figs.append(jfig.to_html(full_html=False, include_plotlyjs=False))
 
@@ -509,6 +555,7 @@ def generate_report(
                 '<p style="font-size:12px;color:#666">'
                 'Green edges = stereo pairs (same timestamp, different camera). '
                 'Blue edges = temporal pairs (same camera, different timestamp). '
+                'Orange edges = cross-camera pairs (different timestamp AND different camera). '
                 'One representative shown per regime (largest joint).</p>'
                 + "".join(graph_figs)
                 + '</div>'
