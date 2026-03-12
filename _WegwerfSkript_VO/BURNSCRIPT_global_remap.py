@@ -403,6 +403,27 @@ def main():
     # pair_result is list-compatible, so pass directly as custom_pairs
     custom_pairs = pair_result
 
+    # ── Early report (pair graph only, before heavy matching) ──
+    logger.info("\n--- Step 3b: Pre-matching Report ---")
+    from UTILREPORT_global_remap import generate_report
+    early_report_html = output_dir / "global_remap_report.html"
+    joints_meta_early = [{k: v for k, v in j.items() if k != "pairs"}
+                         for j in pair_result.joints]
+    try:
+        generate_report(
+            scene_graph_json=sg_json,
+            pairs_txt=output_dir / "_dummy_no_pairs_yet.txt",
+            output_html=early_report_html,
+            custom_pairs=custom_pairs,
+            joints=joints_meta_early,
+            pairs_per_joint_dir=pairs_dir,
+            title=f"Global Remap (pre-matching): {ep_dir.name}",
+        )
+        logger.info("  Pre-matching report: %s", early_report_html)
+        logger.info("  >> Open this NOW to verify pair structure before matching starts!")
+    except Exception as e:
+        logger.warning("  Pre-matching report failed (non-fatal): %s", e)
+
     # ── MASt3R matching + DB ──
     logger.info("\n--- Step 4: MASt3R Matching + COLMAP DB ---")
     from KernLib_M3RSfM.kern_scene_graph_sfm import create_db_from_folder_with_structure
