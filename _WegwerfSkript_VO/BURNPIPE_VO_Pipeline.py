@@ -282,19 +282,19 @@ def _export_slam_outputs(
 
     sg = export_slam_scene_graph(sp.map, sp.graph, sp.stitch_records)
 
-    for sm in sg["submaps"]:
-        sm_dir = slam_dir / f"submap_{sm['submap_id']:03d}"
-        sm_dir.mkdir(parents=True, exist_ok=True)
-        for kf in sm["keyframes"]:
+    def _stage_kf_images(submap_entry, target_dir):
+        """Copy keyframe images into *target_dir*, preserving cam/angle."""
+        count = 0
+        for kf in submap_entry["keyframes"]:
             origin = Path(kf["origin_path"])
             if not origin.is_file():
                 continue
             m = _CAM_ANGLE_RE.search(kf["image_name"])
             if m:
                 cam, angle = m.group(1), m.group(2)
-                dst = sm_dir / cam / angle / kf["image_name"]
+                dst = target_dir / cam / angle / kf["image_name"]
             else:
-                dst = sm_dir / kf["image_name"]
+                dst = target_dir / kf["image_name"]
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.exists():
                 continue
@@ -305,23 +305,27 @@ def _export_slam_outputs(
                     shutil.copy2(str(origin), str(dst))
             else:
                 shutil.copy2(str(origin), str(dst))
+            count += 1
+        return count
+
+    for sm in sg["submaps"]:
+        sm_dir = slam_dir / f"submap_{sm['submap_id']:03d}"
+        sm_dir.mkdir(parents=True, exist_ok=True)
+        _stage_kf_images(sm, sm_dir)
 
     n_kf_images = sum(sm["num_keyframes"] for sm in sg["submaps"])
     logger.info("  Staged %d keyframe images across %d submaps",
                 n_kf_images, len(sg["submaps"]))
 
-    # Rename LC submap directories with _lc suffix for clarity
-    for lc_sid in sg.get("lc_submap_ids", []):
-        lc_dir = slam_dir / f"submap_{lc_sid:03d}"
-        lc_dir_renamed = slam_dir / f"submap_{lc_sid:03d}_lc"
-        if lc_dir.is_dir() and not lc_dir_renamed.exists():
-            lc_dir.rename(lc_dir_renamed)
-    n_lc_renamed = sum(
-        1 for lc_sid in sg.get("lc_submap_ids", [])
-        if (slam_dir / f"submap_{lc_sid:03d}_lc").is_dir()
-    )
-    if n_lc_renamed:
-        logger.info("  Renamed %d LC submap dirs with _lc suffix", n_lc_renamed)
+    for lc_sm in sg.get("lc_submaps", []):
+        lc_dir = slam_dir / f"submap_{lc_sm['submap_id']:03d}_lc"
+        lc_dir.mkdir(parents=True, exist_ok=True)
+        _stage_kf_images(lc_sm, lc_dir)
+
+    n_lc_images = sum(sm["num_keyframes"] for sm in sg.get("lc_submaps", []))
+    if n_lc_images:
+        logger.info("  Staged %d LC keyframe images across %d LC submaps",
+                    n_lc_images, len(sg.get("lc_submaps", [])))
 
     # Unified KeyFrames/ folder: collect ALL cam/angle images at keyframe
     # timestamps from the undistort dir (not just SLAM cameras).

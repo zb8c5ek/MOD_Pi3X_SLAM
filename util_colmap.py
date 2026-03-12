@@ -329,6 +329,10 @@ def export_per_submap_colmap_slam(slam_dir, map_store, graph, shared_K=None,
     Creates::
 
         slam_dir/submap_NNN/sparse/0/{cameras,images,points3D}.txt
+        slam_dir/submap_NNN_lc/sparse/0/{cameras,images,points3D}.txt   (for LC submaps)
+
+    Uses the actual submap ID (``submap.get_id()``) for directory naming.
+    LC submaps get an ``_lc`` suffix.
 
     Args:
         slam_dir: SLAM episode directory (e.g. SLAM/episode_name/).
@@ -338,19 +342,18 @@ def export_per_submap_colmap_slam(slam_dir, map_store, graph, shared_K=None,
         max_export_pts: Max points per submap before subsampling.
 
     Returns:
-        List of (submap_idx, submap_dir, img_full_paths) tuples.
+        List of (submap_id, submap_dir, img_full_paths) tuples.
     """
     if not slam_dir:
         return []
 
     exported = []
-    submap_idx = 0
 
     for submap in map_store.ordered_submaps_by_key():
-        if submap.get_lc_status():
-            continue
-
-        submap_name = f"submap_{submap_idx:03d}"
+        sid = submap.get_id()
+        is_lc = submap.get_lc_status()
+        suffix = "_lc" if is_lc else ""
+        submap_name = f"submap_{sid:03d}{suffix}"
         sparse_dir = os.path.join(slam_dir, submap_name, "sparse", "0")
         os.makedirs(sparse_dir, exist_ok=True)
 
@@ -380,11 +383,11 @@ def export_per_submap_colmap_slam(slam_dir, map_store, graph, shared_K=None,
         if len(points) > 0:
             write_ply(sparse_dir, points, colors)
 
-        exported.append((submap_idx, os.path.join(slam_dir, submap_name),
+        exported.append((sid, os.path.join(slam_dir, submap_name),
                          img_full_paths))
-        print(f"  [SLAM Export] {submap_name}: {len(poses_world)} images, "
+        tag = " [LC]" if is_lc else ""
+        print(f"  [SLAM Export] {submap_name}{tag}: {len(poses_world)} images, "
               f"{len(points)} points -> {sparse_dir}")
-        submap_idx += 1
 
     return exported
 
@@ -431,7 +434,10 @@ def export_slam_scene_graph(map_store, graph, stitch_records=None):
       - frame index, timestamp (ns), origin file path
       - cam2world pose in both submap-local and global frame
 
+    Both non-LC and LC submaps are included (LC submaps carry ``is_lc: true``).
+
     Edges are: intra-submap sequential, inter-submap overlap, loop closure.
+    Loop closure edges are derived from ``stitch_records``.
     Registration quality comes from ``stitch_records``.
 
     Args:
@@ -444,19 +450,14 @@ def export_slam_scene_graph(map_store, graph, stitch_records=None):
         Serialisable dict.
     """
     submaps_out = []
+    lc_submaps_out = []
     group_idx = 0
     submap_id_to_group = {}
-    lc_submaps = []
-    img_name_to_submap = {}
+    lc_submap_ids = []
 
     for submap in map_store.ordered_submaps_by_key():
         sid = submap.get_id()
-        if submap.get_lc_status():
-            lc_submaps.append(submap)
-            continue
-
-        group_name = f"group_{group_idx:03d}"
-        submap_id_to_group[sid] = group_name
+        is_lc = submap.get_lc_status()
 
         poses_world = submap.get_all_poses_world(graph)
         poses_local = submap.get_all_poses()
@@ -480,15 +481,27 @@ def export_slam_scene_graph(map_store, graph, stitch_records=None):
                 "pose_cam2world_global": pose_g,
                 "pose_cam2world_local": pose_l,
             })
-            img_name_to_submap[basename] = (group_name, sid, fidx)
 
-        submaps_out.append({
-            "submap_id": sid,
-            "group": group_name,
-            "num_keyframes": len(keyframes),
-            "keyframes": keyframes,
-        })
-        group_idx += 1
+        if is_lc:
+            lc_submap_ids.append(sid)
+            lc_submaps_out.append({
+                "submap_id": sid,
+                "is_lc": True,
+                "num_keyframes": len(keyframes),
+                "keyframes": keyframes,
+            })
+        else:
+            group_name = f"group_{group_idx:03d}"
+            submap_id_to_group[sid] = group_name
+            for kf in keyframes:
+                kf["group"] = group_name
+            submaps_out.append({
+                "submap_id": sid,
+                "group": group_name,
+                "num_keyframes": len(keyframes),
+                "keyframes": keyframes,
+            })
+            group_idx += 1
 
     # ── KF edges ──
 
@@ -522,27 +535,33 @@ def export_slam_scene_graph(map_store, graph, stitch_records=None):
                 "num_shared": len(shared),
             })
 
-    # Loop closure: trace LC submaps to their connected non-LC submaps.
+    # Loop closure: derive from stitch_records.
+    # Pattern: sequential record (sA->sLC, is_lc=False) immediately precedes
+    # LC record (sLC->sB, is_lc=True). Real edge: submap A <-> submap B.
     lc_edges = []
-    for lc_sub in lc_submaps:
-        connections = []
-        for name in lc_sub.img_names:
-            bn = os.path.basename(name)
-            if bn in img_name_to_submap:
-                connections.append(img_name_to_submap[bn])
-        if len(connections) >= 2:
-            lc_edge = {
-                "type": "loop_closure",
-                "group_a": connections[0][0],
-                "group_b": connections[1][0],
-                "submap_a": connections[0][1],
-                "submap_b": connections[1][1],
-                "kf_a": connections[0][2],
-                "kf_b": connections[1][2],
-                "lc_submap_id": lc_sub.get_id(),
-            }
-            lc_edges.append(lc_edge)
-            kf_edges.append(lc_edge)
+    if stitch_records:
+        for i, rec in enumerate(stitch_records):
+            if not rec.get("is_lc", False):
+                continue
+            lc_sid = rec["submap_prev"]
+            far_sid = rec["submap_curr"]
+            near_sid = None
+            for j in range(i - 1, -1, -1):
+                if (not stitch_records[j].get("is_lc", False)
+                        and stitch_records[j]["submap_curr"] == lc_sid):
+                    near_sid = stitch_records[j]["submap_prev"]
+                    break
+            if near_sid is not None:
+                lc_edge = {
+                    "type": "loop_closure",
+                    "group_a": submap_id_to_group.get(near_sid, ""),
+                    "group_b": submap_id_to_group.get(far_sid, ""),
+                    "submap_a": near_sid,
+                    "submap_b": far_sid,
+                    "lc_submap_id": lc_sid,
+                }
+                lc_edges.append(lc_edge)
+                kf_edges.append(lc_edge)
 
     # ── Registration quality ──
 
@@ -565,10 +584,9 @@ def export_slam_scene_graph(map_store, graph, stitch_records=None):
                 "backend": rec.get("backend"),
             })
 
-    lc_submap_ids = [s.get_id() for s in lc_submaps]
-
     return {
         "submaps": submaps_out,
+        "lc_submaps": lc_submaps_out,
         "kf_edges": kf_edges,
         "loop_closures": lc_edges,
         "lc_submap_ids": lc_submap_ids,
