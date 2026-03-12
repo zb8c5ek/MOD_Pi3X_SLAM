@@ -370,7 +370,7 @@ def main():
     lc_stitch_cfg = strategy_cfg.get("lc_stitch", {})
 
     from kern_global_remap_pairs import generate_pairs as generate_remap_pairs
-    custom_pairs = generate_remap_pairs(
+    pair_result = generate_remap_pairs(
         scene_graph_json=str(sg_json),
         filelist_relpath=filelist,
         temporal_stitch_cfg=temporal_stitch_cfg,
@@ -379,9 +379,29 @@ def main():
     )
 
     n_full = len(filelist) * (len(filelist) - 1) // 2
-    n_pairs = len(custom_pairs) if custom_pairs else n_full
+    n_pairs = len(pair_result) if pair_result else n_full
     logger.info("  %d pairs (vs %d full, %.1fx reduction)",
                 n_pairs, n_full, n_full / max(n_pairs, 1))
+
+    # Write per-joint pair files for debugging
+    pairs_dir = output_dir / "pairs_per_joint"
+    pairs_dir.mkdir(parents=True, exist_ok=True)
+    for joint in pair_result.joints:
+        joint_file = pairs_dir / f"{joint['label']}.txt"
+        with open(joint_file, "w", encoding="utf-8") as f:
+            f.writelines(f"{a} {b}\n" for a, b in joint["pairs"])
+        logger.info("    %s: %d pairs (%d timestamps, submaps %s)",
+                     joint["label"], joint["n_pairs"],
+                     joint["n_timestamps"], joint["submaps"])
+
+    # Write joint summary JSON
+    joints_meta = [{k: v for k, v in j.items() if k != "pairs"} for j in pair_result.joints]
+    with open(pairs_dir / "_joints_summary.json", "w", encoding="utf-8") as f:
+        json.dump({"joints": joints_meta, "summary": pair_result.summary},
+                  f, indent=2, ensure_ascii=False)
+
+    # pair_result is list-compatible, so pass directly as custom_pairs
+    custom_pairs = pair_result
 
     # ── MASt3R matching + DB ──
     logger.info("\n--- Step 4: MASt3R Matching + COLMAP DB ---")
@@ -531,12 +551,16 @@ def main():
 
     pairs_txt = db_output / "pairs.txt"
     report_html = output_dir / "global_remap_report.html"
+    joints_meta = [{k: v for k, v in j.items() if k != "pairs"}
+                    for j in pair_result.joints]
     try:
         generate_report(
             scene_graph_json=sg_json,
             pairs_txt=pairs_txt,
             output_html=report_html,
             custom_pairs=custom_pairs,
+            joints=joints_meta,
+            pairs_per_joint_dir=pairs_dir,
             title=f"Global Remap: {ep_dir.name}",
         )
         logger.info("  Report: %s", report_html)

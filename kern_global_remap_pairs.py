@@ -7,6 +7,8 @@ two complementary regimes:
   - Stereo pairs: configurable cross-camera angle pairings at each timestamp.
   - Temporal chains: ALL cam/angle subfolders linked across consecutive
     timestamps within a configurable ``window_size``.
+  - ``window_timestamp_stride``: step size between paired timestamps
+    (default 1 = consecutive; 2 = every other, reaching further).
 
 **LCStitch** (loop-closure-connected submaps):
   - Stereo pairs: configurable (typically SLAM-camera-centric).
@@ -17,7 +19,8 @@ Both regimes use ``stereo_pairs`` entries that specify which camera pairs to
 link and, optionally, which angles per camera.  When angles are omitted for a
 camera in a stereo entry, ALL angles from the ``rigs`` config are used.
 
-Pure algorithm: reads JSON + config dicts, returns list of (relpath_a, relpath_b).
+Pure algorithm: reads JSON + config dicts, returns PairResult (list-compatible
+with per-joint metadata).
 """
 
 from __future__ import annotations
@@ -190,6 +193,37 @@ class _PairCollector:
         return True
 
 
+class PairResult:
+    """List-compatible result that also carries per-joint metadata.
+
+    Iterating / indexing / len() work on the combined pair list, so existing
+    callers that pass ``PairResult`` as ``custom_pairs`` continue to work.
+    """
+
+    def __init__(
+        self,
+        pairs: List[Tuple[str, str]],
+        joints: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+    ):
+        self.pairs = pairs
+        self.joints = joints
+        self.summary = summary
+
+    # --- list-like interface so callers can use this as List[Tuple] ---
+    def __iter__(self):
+        return iter(self.pairs)
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        return self.pairs[idx]
+
+    def __bool__(self):
+        return bool(self.pairs)
+
+
 # ---------------------------------------------------------------------------
 # Temporal-chain helper
 # ---------------------------------------------------------------------------
@@ -200,13 +234,18 @@ def _add_temporal_chains(
     subfolder_fidx_rp: Dict[str, Dict[int, str]],
     fidxs: Set[int],
     window_size: int,
+    timestamp_stride: int = 1,
 ):
     """Add same-subfolder temporal pairs for *subfolders* within *fidxs*.
 
     ``window_size`` = number of forward timestamps to pair with.
-    0 means pair ALL timestamps in the set with each other (full mesh within
-    the same subfolder).
+    0 means pair ALL timestamps in the set with each other (full mesh).
+
+    ``timestamp_stride`` = step size between paired timestamps.  stride=1
+    pairs consecutive timestamps (i, i+1, i+2, ...); stride=2 pairs every
+    other (i, i+2, i+4, ...), reaching further with the same pair count.
     """
+    stride = max(1, timestamp_stride)
     for sf in subfolders:
         fidx_map = subfolder_fidx_rp.get(sf)
         if not fidx_map:
@@ -222,9 +261,10 @@ def _add_temporal_chains(
         else:
             for i, fidx_a in enumerate(ordered):
                 for step in range(1, window_size + 1):
-                    if i + step >= len(ordered):
+                    target = i + step * stride
+                    if target >= len(ordered):
                         break
-                    collector.add(fidx_map[fidx_a], fidx_map[ordered[i + step]], "temporal")
+                    collector.add(fidx_map[fidx_a], fidx_map[ordered[target]], "temporal")
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +296,8 @@ def generate_pairs(
     temporal_stitch_cfg: Dict[str, Any],
     lc_stitch_cfg: Dict[str, Any],
     rig_angles: Dict[str, List[str]],
-) -> List[Tuple[str, str]]:
-    """Two-regime pair generation.
+) -> PairResult:
+    """Two-regime pair generation with per-joint tracking.
 
     Args:
         scene_graph_json:   Path to scene_graph.json.
@@ -268,9 +308,11 @@ def generate_pairs(
                             used as default when stereo_pairs omit angles.
 
     Returns:
-        Deduplicated list of (relpath_a, relpath_b) pairs.
+        PairResult -- iterates as List[Tuple[str,str]] for backward
+        compatibility; also carries ``.joints`` and ``.summary``.
     """
-    sg = json.load(open(scene_graph_json, "r", encoding="utf-8"))
+    with open(scene_graph_json, "r", encoding="utf-8") as f:
+        sg = json.load(f)
     submaps = sg["submaps"]
     kf_edges = sg.get("kf_edges", [])
     loop_closures = sg.get("loop_closures", [])
@@ -283,32 +325,62 @@ def generate_pairs(
     )
 
     collector = _PairCollector()
+    joints: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Regime 1: TemporalStitch (sequential neighbors)
     # ------------------------------------------------------------------
     ts_stereo_cfg = temporal_stitch_cfg.get("stereo_pairs", [])
     ts_window = temporal_stitch_cfg.get("window_size", 1)
+    ts_stride = temporal_stitch_cfg.get("window_timestamp_stride", 1)
     ts_resolved = _resolve_stereo_pairs(ts_stereo_cfg, rig_angles)
 
-    n_ts_before = len(collector.pairs)
+    n_ts_total = 0
+    seen_ts_groups: Set[frozenset] = set()
 
     for sid in sorted(submap_fidxs.keys()):
         group_sids = _expand_neighbors(seq_neighbors, sid, hops=1)
+        group_key = frozenset(group_sids)
+        if group_key in seen_ts_groups:
+            continue
+        seen_ts_groups.add(group_key)
+
         group_fidxs: Set[int] = set()
         for gsid in group_sids:
             group_fidxs |= submap_fidxs.get(gsid, set())
 
+        n_before = len(collector.pairs)
         _add_stereo_at_timestamps(collector, ts_resolved, subfolder_fidx_rp, group_fidxs)
-        _add_temporal_chains(collector, all_subfolders, subfolder_fidx_rp, group_fidxs, ts_window)
+        _add_temporal_chains(collector, all_subfolders, subfolder_fidx_rp,
+                             group_fidxs, ts_window, ts_stride)
+        n_joint = len(collector.pairs) - n_before
 
-    n_ts = len(collector.pairs) - n_ts_before
+        if n_joint > 0:
+            joint_pairs = collector.pairs[n_before:]
+            sids_sorted = sorted(group_sids)
+            label = "ts_" + "+".join(f"sm{s:03d}" for s in sids_sorted)
+            joints.append({
+                "label": label,
+                "regime": "temporal_stitch",
+                "submaps": sids_sorted,
+                "n_timestamps": len(group_fidxs),
+                "n_pairs": n_joint,
+                "n_stereo": sum(1 for a, b in joint_pairs
+                                if a.split("/")[0] != b.split("/")[0]
+                                and _FRAME_IDX_RE.match(a.rsplit("/", 1)[-1]).group(1) ==
+                                    _FRAME_IDX_RE.match(b.rsplit("/", 1)[-1]).group(1)),
+                "n_temporal": 0,  # filled below
+                "pairs": joint_pairs,
+            })
+            joints[-1]["n_temporal"] = n_joint - joints[-1]["n_stereo"]
+            n_ts_total += n_joint
 
     # ------------------------------------------------------------------
     # Regime 2: LCStitch (loop-closure connections)
     # ------------------------------------------------------------------
     lc_stereo_cfg = lc_stitch_cfg.get("stereo_pairs", [])
     lc_window = lc_stitch_cfg.get("window_size", 0)
+    lc_stride = lc_stitch_cfg.get("window_timestamp_stride", 1)
     lc_resolved = _resolve_stereo_pairs(lc_stereo_cfg, rig_angles)
 
     slam_cameras_cfg = lc_stitch_cfg.get("slam_cameras", {})
@@ -317,7 +389,7 @@ def generate_pairs(
         for ang in angles:
             slam_subfolders.add(f"{cam}_{ang}")
 
-    n_lc_before = len(collector.pairs)
+    n_lc_total = 0
 
     for lc in loop_closures:
         sa = lc.get("submap_a", lc.get("submap_id_a"))
@@ -328,24 +400,58 @@ def generate_pairs(
         if not lc_fidxs:
             continue
 
+        n_before = len(collector.pairs)
         _add_stereo_at_timestamps(collector, lc_resolved, subfolder_fidx_rp, lc_fidxs)
 
         temporal_sfs = slam_subfolders if slam_subfolders else all_subfolders
-        _add_temporal_chains(collector, temporal_sfs, subfolder_fidx_rp, lc_fidxs, lc_window)
+        _add_temporal_chains(collector, temporal_sfs, subfolder_fidx_rp,
+                             lc_fidxs, lc_window, lc_stride)
+        n_joint = len(collector.pairs) - n_before
 
-    n_lc = len(collector.pairs) - n_lc_before
+        if n_joint > 0:
+            joint_pairs = collector.pairs[n_before:]
+            label = f"lc_sm{sa:03d}_sm{sb:03d}"
+            joints.append({
+                "label": label,
+                "regime": "lc_stitch",
+                "submaps": sorted({sa, sb}),
+                "n_timestamps": len(lc_fidxs),
+                "n_pairs": n_joint,
+                "n_stereo": 0,
+                "n_temporal": n_joint,
+                "pairs": joint_pairs,
+            })
+            n_lc_total += n_joint
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
     n_seq_links = sum(len(v) for v in seq_neighbors.values()) // 2
+    summary = {
+        "n_submaps": len(submap_fidxs),
+        "n_seq_links": n_seq_links,
+        "n_loop_closures": len(loop_closures),
+        "n_ts_joints": sum(1 for j in joints if j["regime"] == "temporal_stitch"),
+        "n_lc_joints": sum(1 for j in joints if j["regime"] == "lc_stitch"),
+        "n_ts_pairs": n_ts_total,
+        "n_lc_pairs": n_lc_total,
+        "ts_window": ts_window,
+        "ts_stride": ts_stride,
+        "lc_window": lc_window,
+        "lc_stride": lc_stride,
+        "total": len(collector.pairs),
+        "n_stereo": collector.n_stereo,
+        "n_temporal": collector.n_temporal,
+    }
+
     logger.info(
         "Two-regime pairs: %d submaps, %d seq-links, %d LCs | "
-        "TemporalStitch=%d (window=%d) | LCStitch=%d (window=%d) | "
+        "TemporalStitch=%d (window=%d, stride=%d, %d joints) | "
+        "LCStitch=%d (window=%d, stride=%d, %d joints) | "
         "total=%d unique (%d stereo + %d temporal)",
-        len(submap_fidxs), n_seq_links, len(loop_closures),
-        n_ts, ts_window,
-        n_lc, lc_window,
+        summary["n_submaps"], n_seq_links, len(loop_closures),
+        n_ts_total, ts_window, ts_stride, summary["n_ts_joints"],
+        n_lc_total, lc_window, lc_stride, summary["n_lc_joints"],
         len(collector.pairs), collector.n_stereo, collector.n_temporal,
     )
-    return collector.pairs
+    return PairResult(collector.pairs, joints, summary)

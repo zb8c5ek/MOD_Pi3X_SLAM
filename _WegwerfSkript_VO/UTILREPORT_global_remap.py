@@ -126,11 +126,121 @@ def _aggregate_matches_to_submaps(
     return counts
 
 
+def _build_joint_graph_figure(
+    joint_label: str,
+    joint_pairs: List[Tuple[str, str]],
+    kf_positions: Dict[int, np.ndarray],
+    fidx_to_submap: Dict[int, int],
+    sm_color: Dict[int, str],
+) -> "go.Figure":
+    """Build a 3D Plotly figure showing the pair graph for one joint.
+
+    Nodes are keyframe positions (colored by submap).  Edges are pair
+    connections colored by type: green=stereo (same timestamp, diff cam),
+    blue=temporal (same cam+angle, diff timestamp).
+    """
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+
+    # Collect unique frame indices referenced by these pairs
+    involved_fidxs: Set[int] = set()
+    for rp_a, rp_b in joint_pairs:
+        fa = _extract_frame_idx(rp_a.rsplit("/", 1)[-1])
+        fb = _extract_frame_idx(rp_b.rsplit("/", 1)[-1])
+        if fa is not None:
+            involved_fidxs.add(fa)
+        if fb is not None:
+            involved_fidxs.add(fb)
+
+    # Keyframe positions as nodes
+    sm_fidx_groups: Dict[int, List[int]] = {}
+    for fidx in sorted(involved_fidxs):
+        sid = fidx_to_submap.get(fidx)
+        if sid is not None:
+            sm_fidx_groups.setdefault(sid, []).append(fidx)
+
+    for sid, fidxs in sorted(sm_fidx_groups.items()):
+        xs, ys, zs, texts = [], [], [], []
+        for fidx in fidxs:
+            pos = kf_positions.get(fidx)
+            if pos is not None:
+                xs.append(pos[0]); ys.append(pos[1]); zs.append(pos[2])
+                texts.append(f"f{fidx} sm{sid}")
+        if xs:
+            fig.add_trace(go.Scatter3d(
+                x=xs, y=ys, z=zs, mode="markers",
+                marker=dict(size=4, color=sm_color.get(sid, "gray")),
+                text=texts, hoverinfo="text",
+                name=f"sm{sid:03d}", legendgroup=f"sm{sid}",
+            ))
+
+    # Classify and draw pair edges
+    stereo_lines_x, stereo_lines_y, stereo_lines_z = [], [], []
+    temporal_lines_x, temporal_lines_y, temporal_lines_z = [], [], []
+
+    for rp_a, rp_b in joint_pairs:
+        fa = _extract_frame_idx(rp_a.rsplit("/", 1)[-1])
+        fb = _extract_frame_idx(rp_b.rsplit("/", 1)[-1])
+        if fa is None or fb is None:
+            continue
+        pos_a = kf_positions.get(fa)
+        pos_b = kf_positions.get(fb)
+        if pos_a is None or pos_b is None:
+            continue
+
+        sf_a = rp_a.split("/")[0] if "/" in rp_a else ""
+        sf_b = rp_b.split("/")[0] if "/" in rp_b else ""
+        is_stereo = (fa == fb and sf_a != sf_b)
+
+        if is_stereo:
+            stereo_lines_x.extend([pos_a[0], pos_b[0], None])
+            stereo_lines_y.extend([pos_a[1], pos_b[1], None])
+            stereo_lines_z.extend([pos_a[2], pos_b[2], None])
+        else:
+            temporal_lines_x.extend([pos_a[0], pos_b[0], None])
+            temporal_lines_y.extend([pos_a[1], pos_b[1], None])
+            temporal_lines_z.extend([pos_a[2], pos_b[2], None])
+
+    if temporal_lines_x:
+        fig.add_trace(go.Scatter3d(
+            x=temporal_lines_x, y=temporal_lines_y, z=temporal_lines_z,
+            mode="lines", line=dict(width=1, color="rgba(50,100,220,0.3)"),
+            name="temporal", hoverinfo="skip",
+        ))
+    if stereo_lines_x:
+        fig.add_trace(go.Scatter3d(
+            x=stereo_lines_x, y=stereo_lines_y, z=stereo_lines_z,
+            mode="lines", line=dict(width=2, color="rgba(0,180,0,0.5)"),
+            name="stereo", hoverinfo="skip",
+        ))
+
+    n_stereo = len([x for x in stereo_lines_x if x is not None]) // 2
+    n_temporal = len([x for x in temporal_lines_x if x is not None]) // 2
+    fig.update_layout(
+        title=dict(
+            text=(f"<b>{joint_label}</b><br>"
+                  f"<span style='font-size:12px'>"
+                  f"{len(involved_fidxs)} timestamps | "
+                  f"{len(joint_pairs)} pairs "
+                  f"({n_stereo} stereo + {n_temporal} temporal)"
+                  f"</span>"),
+            x=0.5,
+        ),
+        scene=dict(aspectmode="data",
+                   xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
+        height=500, margin=dict(l=0, r=0, t=60, b=0),
+    )
+    return fig
+
+
 def generate_report(
     scene_graph_json: Path,
     pairs_txt: Path,
     output_html: Path,
     custom_pairs: Optional[List[Tuple[str, str]]] = None,
+    joints: Optional[List[Dict[str, Any]]] = None,
+    pairs_per_joint_dir: Optional[Path] = None,
     title: str = "Global Remap Report",
 ) -> Path:
     """Generate interactive Plotly HTML report.
@@ -141,6 +251,8 @@ def generate_report(
         output_html:      Where to write the HTML file.
         custom_pairs:     Original input pairs (before matching), for
                           showing attempted vs verified connectivity.
+        joints:           Per-submap-joint pair metadata from PairResult.
+        pairs_per_joint_dir: Directory containing per-joint pair .txt files.
         title:            Page title.
 
     Returns:
@@ -328,13 +440,89 @@ def generate_report(
     else:
         table_html = '<div style="margin:20px auto"><p>No verified matches found.</p></div>'
 
-    # Write HTML with plotly figure + stats table
+    # ── Joints table ──
+    if joints:
+        j_header = ("<tr><th>Joint</th><th>Regime</th><th>Submaps</th>"
+                     "<th>Timestamps</th><th>Pairs</th><th>Stereo</th><th>Temporal</th></tr>")
+        j_rows = []
+        for j in joints:
+            regime_color = "#e3f2fd" if j["regime"] == "temporal_stitch" else "#fce4ec"
+            j_rows.append(
+                f'<tr style="background:{regime_color}">'
+                f'<td><code>{j["label"]}</code></td>'
+                f'<td>{j["regime"]}</td>'
+                f'<td>{j["submaps"]}</td>'
+                f'<td>{j["n_timestamps"]}</td>'
+                f'<td><b>{j["n_pairs"]}</b></td>'
+                f'<td>{j.get("n_stereo", 0)}</td>'
+                f'<td>{j.get("n_temporal", 0)}</td>'
+                f'</tr>'
+            )
+        total_pairs = sum(j["n_pairs"] for j in joints)
+        joints_html = (
+            '<div style="max-width:900px;margin:20px auto;font-family:sans-serif">'
+            '<h3>Pair Generation by Submap Joint</h3>'
+            f'<table border="1" cellpadding="4" cellspacing="0" '
+            f'style="border-collapse:collapse;width:100%;font-size:13px">'
+            f'{j_header}{"".join(j_rows)}</table>'
+            f'<p>Total joints: {len(joints)} | '
+            f'TemporalStitch: {sum(1 for j in joints if j["regime"] == "temporal_stitch")} | '
+            f'LCStitch: {sum(1 for j in joints if j["regime"] == "lc_stitch")} | '
+            f'Total attempted pairs: {total_pairs}</p>'
+            '</div>'
+        )
+    else:
+        joints_html = ""
+
+    # ── Joint graph plots (one representative per regime) ──
+    joint_graphs_html = ""
+    if joints and pairs_per_joint_dir and Path(pairs_per_joint_dir).is_dir():
+        ts_joints = [j for j in joints if j["regime"] == "temporal_stitch"]
+        lc_joints = [j for j in joints if j["regime"] == "lc_stitch"]
+
+        representative_joints = []
+        if ts_joints:
+            representative_joints.append(
+                max(ts_joints, key=lambda j: j["n_pairs"]))
+        if lc_joints:
+            representative_joints.append(
+                max(lc_joints, key=lambda j: j["n_pairs"]))
+
+        graph_figs = []
+        for jmeta in representative_joints:
+            pair_file = Path(pairs_per_joint_dir) / f"{jmeta['label']}.txt"
+            if not pair_file.is_file():
+                continue
+            jpairs = _parse_pairs_txt(pair_file)
+            if not jpairs:
+                continue
+            jfig = _build_joint_graph_figure(
+                jmeta["label"], jpairs,
+                kf_positions, fidx_to_submap, sm_color,
+            )
+            graph_figs.append(jfig.to_html(full_html=False, include_plotlyjs=False))
+
+        if graph_figs:
+            joint_graphs_html = (
+                '<div style="max-width:1200px;margin:20px auto;font-family:sans-serif">'
+                '<h3>Representative Joint Pair Graphs</h3>'
+                '<p style="font-size:12px;color:#666">'
+                'Green edges = stereo pairs (same timestamp, different camera). '
+                'Blue edges = temporal pairs (same camera, different timestamp). '
+                'One representative shown per regime (largest joint).</p>'
+                + "".join(graph_figs)
+                + '</div>'
+            )
+
+    # Write HTML with plotly figure + stats table + joints table + joint graphs
     plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn")
 
     full_html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>{title}</title></head>
 <body style="margin:0;padding:0;background:#fafafa">
 {plot_html}
+{joints_html}
+{joint_graphs_html}
 {table_html}
 </body></html>"""
 
