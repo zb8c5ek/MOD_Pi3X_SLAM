@@ -14,7 +14,7 @@ Delegates to two ESSNs:
 
 Output layout::
 
-    VO-en-SLAM_EPISODING_{datetime}/
+    VO-en-SLAM/
     ├── pipeline_report.json
     ├── VO/                                  <-- VO temporal groups
     │   └── episode_{name}/
@@ -160,7 +160,7 @@ def _discover_episode_images(
 # ============================================================================
 
 def _create_vo_output_dir(input_base: Path, output_base: Optional[str]) -> Path:
-    """Create ``VO-en-SLAM_EPISODING_{datetime}/`` output directory."""
+    """Create VO-en-SLAM output directory (standalone: timestamped)."""
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     if output_base:
         vo_dir = Path(output_base)
@@ -172,21 +172,23 @@ def _create_vo_output_dir(input_base: Path, output_base: Optional[str]) -> Path:
 
 
 def _create_episode_outputs(
-    vo_output_dir: Path, episode_name: str,
+    vo_output_dir: Path, episode_name: str, flatten: bool = False,
 ) -> Tuple[Path, Path]:
     """Create per-episode VO and SLAM output directories.
 
-    Layout::
-
-        vo_output_dir/
-          VO/episode_name/group_000/ ...
-          SLAM/episode_name/submap_000/ ...
+    When *flatten* is True (single-episode mode, typical for LORDPIPE
+    EP_NNN layout), output goes directly to ``VO/`` and ``SLAM/``
+    without an episode subfolder.
 
     Returns:
         (vo_episode_dir, slam_episode_dir)
     """
-    vo_ep = vo_output_dir / "VO" / episode_name
-    slam_ep = vo_output_dir / "SLAM" / episode_name
+    if flatten:
+        vo_ep = vo_output_dir / "VO"
+        slam_ep = vo_output_dir / "SLAM"
+    else:
+        vo_ep = vo_output_dir / "VO" / episode_name
+        slam_ep = vo_output_dir / "SLAM" / episode_name
     vo_ep.mkdir(parents=True, exist_ok=True)
     slam_ep.mkdir(parents=True, exist_ok=True)
     return vo_ep, slam_ep
@@ -786,7 +788,7 @@ def run_pipeline(config_path: str) -> int:
 
         # 5c. Create output directories (VO/ and SLAM/ side by side)
         vo_ep_out, slam_ep_out = _create_episode_outputs(
-            vo_output_dir, episode_name)
+            vo_output_dir, episode_name, flatten=(len(episodes) == 1))
         logger.info("VO output:   %s", vo_ep_out)
         logger.info("SLAM output: %s", slam_ep_out)
 
